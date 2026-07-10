@@ -133,6 +133,7 @@ class FeishuChannel:
         self._live_locks: dict[str, asyncio.Lock] = {}
         self._live_tasks: set[asyncio.Task[None]] = set()
         self._live_tasks_by_session: dict[str, set[asyncio.Task[None]]] = {}
+        self._inbound_tasks: set[asyncio.Task[None]] = set()
 
     async def start(self, ctx: ChannelContext) -> None:
         if self._client.is_closed:
@@ -180,6 +181,8 @@ class FeishuChannel:
             await asyncio.to_thread(thread.join, 5)
             if thread.is_alive():
                 raise RuntimeError("飞书长连接线程停止超时")
+        await asyncio.sleep(0)
+        await self._drain_inbound_tasks()
         await self._drain_live_tasks()
         await self._client.aclose()
         self._events_bound = False
@@ -253,9 +256,23 @@ class FeishuChannel:
 
     def _on_sdk_message(self, event: Any) -> None:
         loop = self._loop
-        if loop is None:
+        if loop is None or self._ws_stopped.is_set():
             return
-        _ = asyncio.run_coroutine_threadsafe(self._handle_message_event(event), loop)
+        loop.call_soon_threadsafe(self._start_inbound_task, event)
+
+    def _start_inbound_task(self, event: Any) -> None:
+        if self._ws_stopped.is_set():
+            return
+        task = asyncio.create_task(self._handle_message_event(event))
+        self._inbound_tasks.add(task)
+        task.add_done_callback(self._inbound_tasks.discard)
+
+    async def _drain_inbound_tasks(self) -> None:
+        tasks = tuple(self._inbound_tasks)
+        for task in tasks:
+            _ = task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # ── 入站 ──────────────────────────────────────────────────
 

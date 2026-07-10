@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 
 def _load_plugin_module():
@@ -46,3 +50,85 @@ def test_feishu_plugin_with_config_returns_channel() -> None:
         },
     )()
     assert len(plugin.channels()) == 1
+
+
+@pytest.mark.asyncio
+async def test_inbound_future_is_cancelled_during_stop() -> None:
+    plugin = FeishuPlugin()
+    plugin.context = type(
+        "Ctx",
+        (),
+        {"config": FeishuConfigModel(app_id="app", app_secret="secret")},
+    )()
+    channel = plugin.channels()[0]
+    channel._loop = asyncio.get_running_loop()
+    channel._ws_stopped.clear()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def handle(_event: object) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    channel._handle_message_event = handle
+    channel._on_sdk_message(object())
+    await started.wait()
+    channel._ws_stopped.set()
+    await channel._drain_inbound_tasks()
+
+    assert cancelled.is_set()
+    assert channel._inbound_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_channel_can_start_stop_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = FeishuPlugin()
+    plugin.context = type(
+        "Ctx",
+        (),
+        {"config": FeishuConfigModel(app_id="app", app_secret="secret")},
+    )()
+    channel = plugin.channels()[0]
+    channel_module = sys.modules[type(channel).__module__]
+    starts = 0
+
+    class IdentityIndex:
+        def __init__(self, *_args, **_kwargs) -> None:
+            return None
+
+        def rebuild(self) -> int:
+            return 0
+
+    def run_ws_client() -> None:
+        nonlocal starts
+        starts += 1
+        channel._ws_stopped.wait()
+
+    monkeypatch.setattr(channel_module, "SessionIdentityIndex", IdentityIndex)
+    channel._run_ws_client = run_ws_client
+    registry = SimpleNamespace(
+        on=lambda *_args: object(),
+        register_channel=lambda *_args, **_kwargs: object(),
+        subscribe_outbound=lambda *_args: object(),
+    )
+    context = SimpleNamespace(
+        bus=registry,
+        event_bus=registry,
+        push_tool=registry,
+        interrupt_controller=None,
+        attachment_store=None,
+        session_manager=None,
+    )
+
+    await channel.start(context)
+    await channel.stop()
+    await channel.start(context)
+    await channel.stop()
+
+    assert starts == 2
+    assert channel._ws_thread is None
