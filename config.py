@@ -9,7 +9,7 @@ _UNRESOLVED_ENV_RE = re.compile(r"^\$\{\w+\}$")
 _DEFAULT_DOMAIN = "https://open.feishu.cn"
 
 
-# 飞书插件配置，来自主 config.toml 的 [plugins.feishu]，支持 ${ENV} 插值。
+# 飞书插件配置来自插件数据目录下的 config.local.toml。
 class FeishuConfigModel(BaseModel):
     app_id: str = Field(
         default="",
