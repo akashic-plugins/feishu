@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 class FeishuPlugin(Plugin):
     name = "feishu"
+    version = "1.0.0"
     desc = "飞书私聊渠道"
     ConfigModel = FeishuConfigModel
 
