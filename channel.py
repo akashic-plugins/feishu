@@ -135,6 +135,8 @@ class FeishuChannel:
         self._live_tasks_by_session: dict[str, set[asyncio.Task[None]]] = {}
 
     async def start(self, ctx: ChannelContext) -> None:
+        if self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=30.0)
         self._bus = ctx.bus
         self._loop = asyncio.get_running_loop()
         self._interrupt_controller = ctx.interrupt_controller
@@ -173,8 +175,18 @@ class FeishuChannel:
     async def stop(self) -> None:
         self._ws_stopped.set()
         await self._disconnect_ws()
+        thread = self._ws_thread
+        if thread is not None:
+            await asyncio.to_thread(thread.join, 5)
+            if thread.is_alive():
+                raise RuntimeError("飞书长连接线程停止超时")
         await self._drain_live_tasks()
         await self._client.aclose()
+        self._events_bound = False
+        self._outbound_bound = False
+        self._ws_client = None
+        self._ws_loop = None
+        self._ws_thread = None
         logger.info("[feishu] 飞书私聊渠道已停止")
 
     def _require_bus(self) -> MessageBus:
