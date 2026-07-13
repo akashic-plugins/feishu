@@ -14,6 +14,7 @@ import json
 import logging
 import threading
 import time
+import warnings
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,7 @@ _LIVE_STREAM_MIN_INTERVAL_S = 2.0
 _LIVE_MAX_FAILURES = 3
 _LIVE_MAX_BACKOFF_S = 16.0
 _WS_RECONNECT_DELAY_S = 5.0
+_WS_STOP_TIMEOUT_S = 2.0
 _CARD_TEXT_LIMIT = 4000
 _MESSAGE_MAX_ATTEMPTS = 4
 _RETRY_BASE_DELAY_S = 0.5
@@ -178,7 +180,7 @@ class FeishuChannel:
         await self._disconnect_ws()
         thread = self._ws_thread
         if thread is not None:
-            await asyncio.to_thread(thread.join, 5)
+            await asyncio.to_thread(thread.join, _WS_STOP_TIMEOUT_S)
             if thread.is_alive():
                 raise RuntimeError("飞书长连接线程停止超时")
         await asyncio.sleep(0)
@@ -209,17 +211,32 @@ class FeishuChannel:
                 try:
                     self._build_ws_client().start()
                 except Exception as e:
+                    if self._ws_stopped.is_set():
+                        break
                     logger.warning("[feishu] 长连接退出，准备重连: %s", e)
                 if self._ws_stopped.is_set():
                     break
                 time.sleep(_WS_RECONNECT_DELAY_S)
         finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                _ = task.cancel()
+            if pending:
+                _ = loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
             loop.close()
 
     def _build_ws_client(self) -> Any:
-        from lark_oapi.core.enum import LogLevel
-        from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
-        from lark_oapi.ws import Client as WsClient
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"^pkg_resources is deprecated as an API\.",
+                category=UserWarning,
+            )
+            from lark_oapi.core.enum import LogLevel
+            from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+            from lark_oapi.ws import Client as WsClient
 
         handler = (
             EventDispatcherHandler.builder("", "")
@@ -232,6 +249,7 @@ class FeishuChannel:
             log_level=LogLevel.INFO,
             event_handler=handler,
             domain=self._domain,
+            auto_reconnect=False,
         )
         self._ws_client = ws_client
         return ws_client
@@ -239,20 +257,22 @@ class FeishuChannel:
     async def _disconnect_ws(self) -> None:
         ws_client = self._ws_client
         ws_loop = self._ws_loop
-        if ws_client is None or ws_loop is None:
+        if ws_client is None:
             return
+        if ws_loop is None:
+            raise RuntimeError("飞书长连接缺少事件循环")
         raw_disconnect = getattr(ws_client, "_disconnect", None)
-        disconnect = cast(
-            Callable[[], Coroutine[Any, Any, None]] | None,
-            raw_disconnect if callable(raw_disconnect) else None,
-        )
-        if disconnect is None:
-            return
+        if not callable(raw_disconnect):
+            raise RuntimeError("飞书 SDK 不支持主动断开长连接")
+        disconnect = cast(Callable[[], Coroutine[Any, Any, None]], raw_disconnect)
         future = asyncio.run_coroutine_threadsafe(disconnect(), ws_loop)
         try:
-            await asyncio.wait_for(asyncio.wrap_future(future), timeout=5)
-        except (TimeoutError, Exception) as e:
-            logger.warning("[feishu] 长连接停止异常: %s", e)
+            await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                timeout=_WS_STOP_TIMEOUT_S,
+            )
+        finally:
+            ws_loop.call_soon_threadsafe(ws_loop.stop)
 
     def _on_sdk_message(self, event: Any) -> None:
         loop = self._loop

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -132,3 +133,32 @@ async def test_channel_can_start_stop_twice(
 
     assert starts == 2
     assert channel._ws_thread is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_stops_sdk_event_loop() -> None:
+    plugin = FeishuPlugin()
+    plugin.context = type(
+        "Ctx",
+        (),
+        {"config": FeishuConfigModel(app_id="app", app_secret="secret")},
+    )()
+    channel = plugin.channels()[0]
+    ws_loop = asyncio.new_event_loop()
+    disconnected = threading.Event()
+
+    class _WsClient:
+        async def _disconnect(self) -> None:
+            disconnected.set()
+
+    thread = threading.Thread(target=ws_loop.run_forever)
+    thread.start()
+    channel._ws_client = _WsClient()
+    channel._ws_loop = ws_loop
+
+    await channel._disconnect_ws()
+    await asyncio.to_thread(thread.join, 2)
+    ws_loop.close()
+
+    assert disconnected.is_set()
+    assert not thread.is_alive()
