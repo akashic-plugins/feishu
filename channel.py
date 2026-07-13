@@ -73,6 +73,20 @@ class FeishuApiError(RuntimeError):
         self.code = code
 
 
+class _SdkShutdownLogFilter(logging.Filter):
+    """仅过滤 SDK 对主动关闭连接产生的错误日志。"""
+
+    def __init__(self, stopped: threading.Event) -> None:
+        super().__init__()
+        self._stopped = stopped
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            self._stopped.is_set()
+            and record.getMessage().startswith("receive message loop exit")
+        )
+
+
 def _is_rate_limited(err: Exception) -> bool:
     if isinstance(err, httpx.HTTPStatusError):
         return err.response.status_code == 429
@@ -121,6 +135,8 @@ class FeishuChannel:
         self._ws_loop: asyncio.AbstractEventLoop | None = None
         self._ws_thread: threading.Thread | None = None
         self._ws_stopped = threading.Event()
+        self._sdk_logger: logging.Logger | None = None
+        self._sdk_shutdown_filter: logging.Filter | None = None
         # live 预览状态
         self._live_messages: dict[str, str] = {}
         self._reply_buffers: dict[str, str] = {}
@@ -183,6 +199,7 @@ class FeishuChannel:
             await asyncio.to_thread(thread.join, _WS_STOP_TIMEOUT_S)
             if thread.is_alive():
                 raise RuntimeError("飞书长连接线程停止超时")
+        self._remove_sdk_shutdown_filter()
         await asyncio.sleep(0)
         await self._drain_inbound_tasks()
         await self._drain_live_tasks()
@@ -205,6 +222,7 @@ class FeishuChannel:
     def _run_ws_client(self) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        loop.set_exception_handler(self._handle_ws_loop_exception)
         self._ws_loop = loop
         try:
             while not self._ws_stopped.is_set():
@@ -235,8 +253,15 @@ class FeishuChannel:
                 category=UserWarning,
             )
             from lark_oapi.core.enum import LogLevel
+            from lark_oapi.core.log import logger as sdk_logger
             from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
             from lark_oapi.ws import Client as WsClient
+
+        self._remove_sdk_shutdown_filter()
+        shutdown_filter = _SdkShutdownLogFilter(self._ws_stopped)
+        sdk_logger.addFilter(shutdown_filter)
+        self._sdk_logger = sdk_logger
+        self._sdk_shutdown_filter = shutdown_filter
 
         handler = (
             EventDispatcherHandler.builder("", "")
@@ -253,6 +278,21 @@ class FeishuChannel:
         )
         self._ws_client = ws_client
         return ws_client
+
+    def _handle_ws_loop_exception(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        context: dict[str, Any],
+    ) -> None:
+        if self._ws_stopped.is_set():
+            return
+        loop.default_exception_handler(context)
+
+    def _remove_sdk_shutdown_filter(self) -> None:
+        if self._sdk_logger is not None and self._sdk_shutdown_filter is not None:
+            self._sdk_logger.removeFilter(self._sdk_shutdown_filter)
+        self._sdk_logger = None
+        self._sdk_shutdown_filter = None
 
     async def _disconnect_ws(self) -> None:
         ws_client = self._ws_client

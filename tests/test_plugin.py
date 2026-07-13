@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import logging
 import sys
 import threading
 from pathlib import Path
@@ -28,6 +29,7 @@ def _load_plugin_module():
 module = _load_plugin_module()
 FeishuConfigModel = module.FeishuConfigModel
 FeishuPlugin = module.FeishuPlugin
+SdkShutdownLogFilter = sys.modules[FeishuPlugin.__module__.removesuffix(".plugin") + ".channel"]._SdkShutdownLogFilter
 
 
 def test_feishu_plugin_without_config_returns_no_channels() -> None:
@@ -51,6 +53,24 @@ def test_feishu_plugin_with_config_returns_channel() -> None:
         },
     )()
     assert len(plugin.channels()) == 1
+
+
+def test_sdk_shutdown_filter_only_hides_errors_after_stop() -> None:
+    stopped = threading.Event()
+    log_filter = SdkShutdownLogFilter(stopped)
+    record = logging.LogRecord(
+        "Lark",
+        logging.ERROR,
+        __file__,
+        1,
+        "receive message loop exit, err: closed",
+        (),
+        None,
+    )
+
+    assert log_filter.filter(record)
+    stopped.set()
+    assert not log_filter.filter(record)
 
 
 @pytest.mark.asyncio
