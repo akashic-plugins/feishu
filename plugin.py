@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 
 class FeishuPlugin(Plugin):
+    api_version = 2
     name = "feishu"
     version = "1.0.0"
     desc = "飞书私聊渠道"
