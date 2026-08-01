@@ -23,7 +23,13 @@ from typing import Any, cast
 import httpx
 
 from agent.looping.interrupt import InterruptController
-from bus.events import InboundMessage, OutboundMessage
+from bus.events import (
+    ChannelMessage,
+    DeliveryReceipt,
+    InboundMessage,
+    OutboundMessage,
+    channel_message_from_outbound,
+)
 from bus.events_lifecycle import (
     StreamDeltaReady,
     ToolCallCompleted,
@@ -33,6 +39,7 @@ from bus.events_lifecycle import (
 from bus.queue import MessageBus
 from infra.channels.base import AttachmentStore, MessageDeduper, SessionIdentityIndex
 from infra.channels.contract import ChannelContext
+from infra.channels.delivery import deliver_message_parts
 from .cards import (
     ToolLiveLine,
     build_live_card,
@@ -174,10 +181,7 @@ class FeishuChannel:
             self._events_bound = True
         ctx.push_tool.register_channel(
             self.name,
-            text=self.send,
-            stream_text=self.send_stream,
-            file=self.send_file,
-            image=self.send_image,
+            deliver=self._deliver_message,
         )
         if not self._outbound_bound:
             ctx.bus.subscribe_outbound(_CHANNEL, self._on_response)
@@ -590,23 +594,17 @@ class FeishuChannel:
 
     async def _on_response(self, msg: OutboundMessage) -> None:
         session_key = f"{_CHANNEL}:{msg.chat_id}"
-        content = msg.content.strip()
         thinking = self._final_thinking_text(session_key, msg.thinking)
         tool_lines = self._tool_lines.get(session_key, [])
         if session_key in self._live_messages:
             await self._cancel_live_tasks(session_key)
         # 1. 把实时预览卡原地定格为"过程"卡（思考折叠 + 工具），不撤回
         await self._freeze_live_card(session_key, msg.chat_id, thinking, tool_lines)
-        # 2. 最终结果单独发一条（超长分块、失败降级纯文本）
-        if content:
-            for chunk in _split_markdown(content, _CARD_TEXT_LIMIT):
-                await self._post_card_or_text(msg.chat_id, build_markdown_card(chunk), chunk)
+        # 2. 通过统一 adapter 提交正文与附件，并让失败继续向上游传播
+        receipt = await self._deliver_message(channel_message_from_outbound(msg))
         self._clear_live_session(session_key)
-        for image in (msg.media or []):
-            try:
-                await self.send_image(msg.chat_id, image)
-            except Exception as e:
-                logger.warning("[feishu] 媒体图片发送失败 chat_id=%s path=%s err=%s", msg.chat_id, image, e)
+        if not receipt.succeeded:
+            raise RuntimeError(receipt.detail or "飞书消息提交失败")
 
     # 把实时预览卡 PATCH 成过程卡（思考折叠 + 工具时间线）；无预览卡但有过程则新发一张。不撤回。
     async def _freeze_live_card(
@@ -684,6 +682,16 @@ class FeishuChannel:
         _ = await self._post_message(chat_id, "file", content)
         if caption and caption.strip():
             await self.send(chat_id, caption)
+
+    async def _deliver_message(self, message: ChannelMessage) -> DeliveryReceipt:
+        """以飞书原生调用提交完整消息并报告部分送达。"""
+
+        return await deliver_message_parts(
+            message,
+            send_text=self.send,
+            send_file=self.send_file,
+            send_image=self.send_image,
+        )
 
     # ── live 任务管理 ──────────────────────────────────────────
 

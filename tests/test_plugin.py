@@ -10,6 +10,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.tools.message_push import MessagePushTool
+from bus.events import (
+    AttachmentKind,
+    ChannelAttachment,
+    ChannelMessage,
+    DeliveryStatus,
+)
+
 
 def _load_plugin_module():
     path = Path(__file__).parents[1] / "plugin.py"
@@ -134,13 +142,13 @@ async def test_channel_can_start_stop_twice(
     channel._run_ws_client = run_ws_client
     registry = SimpleNamespace(
         on=lambda *_args: object(),
-        register_channel=lambda *_args, **_kwargs: object(),
         subscribe_outbound=lambda *_args: object(),
     )
+    push_tools = [MessagePushTool(), MessagePushTool()]
     context = SimpleNamespace(
         bus=registry,
         event_bus=registry,
-        push_tool=registry,
+        push_tool=push_tools[0],
         interrupt_controller=None,
         attachment_store=None,
         session_manager=None,
@@ -148,11 +156,61 @@ async def test_channel_can_start_stop_twice(
 
     await channel.start(context)
     await channel.stop()
+    context.push_tool = push_tools[1]
     await channel.start(context)
     await channel.stop()
 
     assert starts == 2
     assert channel._ws_thread is None
+    assert all("feishu" in tool._adapters for tool in push_tools)
+
+
+@pytest.mark.asyncio
+async def test_delivery_adapter_submits_complete_message() -> None:
+    plugin = FeishuPlugin()
+    plugin.context = type(
+        "Ctx",
+        (),
+        {"config": FeishuConfigModel(app_id="app", app_secret="secret")},
+    )()
+    channel = plugin.channels()[0]
+    calls: list[tuple[object, ...]] = []
+
+    async def send_text(chat_id: str, content: str) -> None:
+        calls.append(("text", chat_id, content))
+
+    async def send_file(
+        chat_id: str,
+        path: str,
+        name: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        calls.append(("file", chat_id, path, name, caption))
+
+    async def send_image(chat_id: str, path: str) -> None:
+        calls.append(("image", chat_id, path))
+
+    channel.send = send_text
+    channel.send_file = send_file
+    channel.send_image = send_image
+    receipt = await channel._deliver_message(
+        ChannelMessage(
+            channel="feishu",
+            chat_id="ou_1",
+            content="正文",
+            attachments=(
+                ChannelAttachment(AttachmentKind.FILE, "/tmp/a.txt", "a.txt"),
+                ChannelAttachment(AttachmentKind.IMAGE, "/tmp/a.png"),
+            ),
+        )
+    )
+
+    assert receipt.status is DeliveryStatus.SUCCESS
+    assert calls == [
+        ("text", "ou_1", "正文"),
+        ("file", "ou_1", "/tmp/a.txt", "a.txt", None),
+        ("image", "ou_1", "/tmp/a.png"),
+    ]
 
 
 @pytest.mark.asyncio
