@@ -146,3 +146,69 @@ async def test_manager_formal_candidate_discard_promote_and_cleanup(
     assert manager.active_channel_generation is None
     assert factory.close_calls == 2
     assert factory.client.closed == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config_text", "missing_credential"),
+    (
+        ('appSecret = "formal-app-secret"\n', "app_id"),
+        ('appId = "formal-app-id"\n', "app_secret"),
+    ),
+)
+async def test_formal_start_rejects_missing_credential_before_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_text: str,
+    missing_credential: str,
+) -> None:
+    """Reject an incomplete formal credential pair before any channel resource starts."""
+
+    plugin_root, workspace = _stage(tmp_path)
+    config_path = workspace / "plugin-data" / "feishu-builtin" / "config.local.toml"
+    config_path.write_text(config_text, encoding="utf-8")
+    factory = FakeProviderFactory()
+    adapters: list[Any] = []
+    original_resolver = channel_generation_host._resolve_sync_factory
+
+    def resolve_factory(module, export):
+        factory_callable = original_resolver(module, export)
+
+        def wrapped(context):
+            adapter = cast(Any, factory_callable(context))
+            adapter._run_ws_client = lambda: adapter._ws_stopped.wait()
+            adapters.append(adapter)
+            return adapter
+
+        return wrapped
+
+    monkeypatch.setattr(
+        channel_generation_host,
+        "_resolve_sync_factory",
+        resolve_factory,
+    )
+    manager = PluginManager(
+        plugin_dirs=[plugin_root.parent],
+        event_bus=EventBus(),
+        tool_registry=None,
+        workspace=workspace,
+        installed_cache_root=tmp_path / "home" / "cache",
+    )
+    manager.bind_channel_provider_factory_resolver(lambda snapshot: {"feishu": factory})
+
+    with pytest.raises(RuntimeError, match=missing_credential):
+        await manager.load_all()
+
+    assert len(adapters) == 1
+    adapter = adapters[0]
+    assert factory.create_calls == 1
+    assert factory.client.closed
+    assert adapter._provider_client is None
+    assert adapter._client is None
+    assert adapter._stream_subscription is None
+    assert adapter._ws_client is None
+    assert adapter._ws_loop is None
+    assert adapter._ws_thread is None
+    assert not adapter._ws_thread_started
+    assert not adapter._started
+    assert manager.active_channel_generation is None

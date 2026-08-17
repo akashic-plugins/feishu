@@ -176,6 +176,8 @@ class FeishuAdapter:
         try:
             # 1. Only the formal Host invokes ProviderClientFactory and unwraps refs.
             self._provider_client = await self._provider_factory.create(self._credentials)
+            self._read_credential("app_id")
+            self._read_credential("app_secret")
             self._client = httpx.AsyncClient(timeout=30.0)
 
             # 2. Subscribe through the exact Core stream and keep admission closed.
