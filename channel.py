@@ -276,6 +276,7 @@ class FeishuAdapter:
             and self._client is None
             and self._provider_client is None
         ):
+            self._clear_transient_state()
             return StopReceipt(self._binding_token, resources_closed=True)
         self._stopping = True
         failures: list[ChannelCleanupFailure] = []
@@ -318,9 +319,12 @@ class FeishuAdapter:
         tasks = tuple(self._inbound_tasks)
         for task in tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._inbound_tasks.clear()
+        try:
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self._inbound_tasks.clear()
+            self._clear_transient_state()
 
         # 4. Release adapter-owned formal resources; Core closes the factory separately.
         if self._client is not None:
@@ -528,7 +532,14 @@ class FeishuAdapter:
         sender = open_id or user_id or union_id
         if not sender:
             return DeliveryStatus.REJECTED
-        inbound_text, reply_meta = await self._merge_reply_context(message, content)
+        is_stop = content.strip() == "/stop"
+        if is_stop:
+            # Control messages must not fetch or merge reply context first.
+            inbound_text = content.strip()
+            reply_meta: dict[str, str] = {}
+        else:
+            inbound_text, reply_meta = await self._merge_reply_context(message, content)
+            inbound_text = _visible_text(inbound_text)
         raw_message = ChannelInboundMessage(
             channel=_CHANNEL,
             sender=sender,
@@ -550,7 +561,7 @@ class FeishuAdapter:
             provider_identity=sender,
             recipient=chat_id,
         )
-        if content.strip() == "/stop":
+        if is_stop:
             return await self._interrupt(raw)
         if self._ingress is None:
             raise RuntimeError("Feishu ingress port 未绑定")
@@ -678,7 +689,7 @@ class FeishuAdapter:
             finally:
                 self._clear_presentation(event.presentation_id, payload.turn_id)
         except asyncio.CancelledError:
-            self._failed_presentations.add(event.presentation_id)
+            self._clear_presentation(event.presentation_id, _turn_id(event))
             raise
         except Exception as error:
             self._failed_presentations.add(event.presentation_id)
@@ -764,6 +775,19 @@ class FeishuAdapter:
         self._preview_messages.pop(presentation_id, None)
         self._failed_presentations.discard(presentation_id)
         self._rejected_presentations.discard(presentation_id)
+
+    def _clear_transient_state(self) -> None:
+        """Release all in-memory inbound and preview state during channel stop."""
+
+        self._inbound_recipients.clear()
+        self._turn_recipients.clear()
+        self._presentation_client_messages.clear()
+        self._reply_buffers.clear()
+        self._thinking_buffers.clear()
+        self._tool_lines.clear()
+        self._preview_messages.clear()
+        self._failed_presentations.clear()
+        self._rejected_presentations.clear()
 
     # ------------------------------------------------------------------
     # REST and delivery classifier
@@ -1052,6 +1076,25 @@ def _extract_text(content: str) -> str:
     if not isinstance(parsed, dict):
         return content.strip()
     return str(parsed.get("text") or "").strip()
+
+
+def _visible_text(value: str) -> str:
+    """Escape control characters into visible markers accepted by Core text DTOs."""
+
+    pieces: list[str] = []
+    for char in value:
+        codepoint = ord(char)
+        if codepoint >= 32:
+            pieces.append(char)
+        elif char == "\n":
+            pieces.append(r"\n")
+        elif char == "\r":
+            pieces.append(r"\r")
+        elif char == "\t":
+            pieces.append(r"\t")
+        else:
+            pieces.append(f"\\x{codepoint:02x}")
+    return "".join(pieces)
 
 
 def _split_markdown(text: str, limit: int) -> list[str]:

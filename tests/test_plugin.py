@@ -631,6 +631,164 @@ async def test_stop_uses_exact_core_control_port() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reply_stop_bypasses_parent_fetch_and_uses_exact_control_port() -> None:
+    control = FakeControl()
+    adapter = module.build_feishu_channel(_context(control=control))
+    stream = FakeTurnStream()
+    adapter.attach_presentation(
+        ChannelPresentationPorts(control=control, turn_stream=stream)
+    )
+    message = _message(content='{"text":"/stop"}')
+    message.parent_id = "parent-1"
+
+    async def fail_parent_fetch(message_id: str) -> str:
+        raise AssertionError(f"reply parent must not be fetched for {message_id}")
+
+    adapter._fetch_message_text = fail_parent_fetch  # type: ignore[method-assign]
+    status = await adapter._ingest_message(
+        message,
+        "stop-reply-1",
+        "oc_chat",
+        "ou_sender",
+        "",
+        "",
+    )
+
+    assert status is DeliveryStatus.DELIVERED
+    assert control.raw is not None
+    assert control.raw.message.content == "/stop"
+    assert "reply_to_message_id" not in control.raw.message.metadata
+
+
+@pytest.mark.asyncio
+async def test_multiline_inbound_is_admitted_with_visible_control_markers() -> None:
+    ingress = FakeIngress()
+    stream = FakeTurnStream()
+    adapter = module.build_feishu_channel(_context(ingress=ingress, stream=stream))
+    adapter.attach_presentation(
+        ChannelPresentationPorts(control=FakeControl(), turn_stream=stream)
+    )
+
+    status = await adapter._ingest_message(
+        _message(content='{"text":"hello\\nworld\\t!"}'),
+        "msg-lines",
+        "oc_chat",
+        "ou_sender",
+        "",
+        "",
+    )
+
+    assert status is DeliveryStatus.DELIVERED
+    assert ingress.raw[0].message.content == r"hello\nworld\t!"
+    assert all(ord(char) >= 32 for char in ingress.raw[0].message.content)
+
+
+@pytest.mark.asyncio
+async def test_reply_context_is_admitted_with_visible_control_markers() -> None:
+    ingress = FakeIngress()
+    stream = FakeTurnStream()
+    adapter = module.build_feishu_channel(_context(ingress=ingress, stream=stream))
+    adapter.attach_presentation(
+        ChannelPresentationPorts(control=FakeControl(), turn_stream=stream)
+    )
+    message = _message(content='{"text":"reply"}')
+    message.parent_id = "parent-1"
+
+    async def fetch_parent(message_id: str) -> str:
+        assert message_id == "parent-1"
+        return "parent\nline\t!"
+
+    adapter._fetch_message_text = fetch_parent  # type: ignore[method-assign]
+    status = await adapter._ingest_message(
+        message,
+        "msg-reply",
+        "oc_chat",
+        "ou_sender",
+        "",
+        "",
+    )
+
+    assert status is DeliveryStatus.DELIVERED
+    assert ingress.raw[0].message.content == (
+        r"【你正在回复一条历史消息】\n"
+        r"被回复消息：\nparent\nline\t!\n\n"
+        r"【你当前新消息】\nreply"
+    )
+    assert ingress.raw[0].message.metadata["reply_to_message_id"] == "parent-1"
+
+
+@pytest.mark.asyncio
+async def test_stop_clears_all_transient_state_even_when_resources_already_closed() -> None:
+    adapter = module.build_feishu_channel(_context())
+    adapter._inbound_recipients["msg-1"] = "oc_chat"
+    adapter._turn_recipients["turn-1"] = "oc_chat"
+    adapter._presentation_client_messages["preview-1"] = "msg-1"
+    adapter._reply_buffers["preview-1"] = "reply"
+    adapter._thinking_buffers["preview-1"] = "thinking"
+    adapter._tool_lines["preview-1"] = []
+    adapter._preview_messages["preview-1"] = "provider-1"
+    adapter._failed_presentations.add("preview-1")
+    adapter._rejected_presentations.add("preview-2")
+
+    receipt = await adapter.stop()
+
+    assert receipt.resources_closed
+    assert adapter._inbound_recipients == {}
+    assert adapter._turn_recipients == {}
+    assert adapter._presentation_client_messages == {}
+    assert adapter._reply_buffers == {}
+    assert adapter._thinking_buffers == {}
+    assert adapter._tool_lines == {}
+    assert adapter._preview_messages == {}
+    assert adapter._failed_presentations == set()
+    assert adapter._rejected_presentations == set()
+
+    adapter._stopping = True
+    adapter._inbound_recipients["msg-2"] = "oc_chat"
+    second = await adapter.stop()
+    assert second.resources_closed
+    assert adapter._inbound_recipients == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_stream_clears_preview_and_recipient_state() -> None:
+    stream = FakeTurnStream()
+    adapter = module.build_feishu_channel(_context(stream=stream))
+    adapter.attach_presentation(
+        ChannelPresentationPorts(control=FakeControl(), turn_stream=stream)
+    )
+    adapter._inbound_recipients["msg-cancel"] = "oc_chat"
+    waiting = asyncio.Event()
+
+    async def block_preview(event, recipient: str, *, live: bool):
+        await waiting.wait()
+
+    adapter._sync_preview = block_preview  # type: ignore[method-assign]
+    started = TurnStreamEvent(
+        "preview:cancel",
+        TurnStreamEventKind.TURN_STARTED,
+        TurnStartedPresentation("turn-cancel", "msg-cancel"),
+    )
+    task = asyncio.create_task(adapter._on_turn_stream(started))
+    await asyncio.sleep(0)
+    assert adapter._turn_recipients == {"turn-cancel": "oc_chat"}
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert adapter._inbound_recipients == {}
+    assert adapter._turn_recipients == {}
+    assert adapter._presentation_client_messages == {}
+    assert adapter._reply_buffers == {}
+    assert adapter._thinking_buffers == {}
+    assert adapter._tool_lines == {}
+    assert adapter._preview_messages == {}
+    assert adapter._failed_presentations == set()
+    assert adapter._rejected_presentations == set()
+
+
+@pytest.mark.asyncio
 async def test_turn_stream_keeps_one_preview_id_and_final_summary_patch() -> None:
     stream = FakeTurnStream()
     adapter = module.build_feishu_channel(_context(stream=stream))
