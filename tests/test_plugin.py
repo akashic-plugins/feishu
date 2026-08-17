@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -149,12 +150,17 @@ def _context(
     identity: FakeIdentity | None = None,
     control: FakeControl | None = None,
     stream: FakeTurnStream | None = None,
+    config: dict[str, object] | None = None,
 ) -> ChannelFactoryContext:
     return ChannelFactoryContext(
         snapshot_id="snapshot-1",
         generation_id="generation-1",
         binding_token="binding-1",
-        config={"allow_from": ("ou_sender",), "domain": "https://example.test"},
+        config=(
+            config
+            if config is not None
+            else {"allow_from": ("ou_sender",), "domain": "https://example.test"}
+        ),
         credentials={
             "appId": CredentialRef(("appId",)),
             "appSecret": CredentialRef(("appSecret",)),
@@ -176,6 +182,17 @@ def _message(*, message_type: str = "text", content: str = '{"text":"hello"}'):
         content=content,
         parent_id="",
         create_time="1700000000000",
+    )
+
+
+def _event(*, content: str = '{"text":"hello"}', open_id: str = "ou_sender"):
+    return SimpleNamespace(
+        event=SimpleNamespace(
+            message=_message(content=content),
+            sender=SimpleNamespace(
+                sender_id=SimpleNamespace(open_id=open_id, user_id="", union_id="")
+            ),
+        )
     )
 
 
@@ -205,6 +222,21 @@ def test_config_accepts_only_opaque_credential_refs() -> None:
     assert config.app_id == CredentialRef(("appId",))
     with pytest.raises(ValidationError):
         module.Config.model_validate({"appId": "secret"})
+
+
+def test_config_accepts_legacy_allow_from_alias_and_forbids_unknown_keys() -> None:
+    from pydantic import ValidationError
+
+    config = module.Config.model_validate(
+        {
+            "appId": CredentialRef(("appId",)),
+            "appSecret": CredentialRef(("appSecret",)),
+            "allowFrom": ["ou_sender"],
+        }
+    )
+    assert config.allow_from == ("ou_sender",)
+    with pytest.raises(ValidationError):
+        module.Config.model_validate({"unknown": True})
 
 
 @pytest.mark.asyncio
@@ -261,6 +293,8 @@ async def test_formal_start_deliver_and_stop_use_controlled_provider_client() ->
         "appId": CredentialRef(("appId",)),
         "appSecret": CredentialRef(("appSecret",)),
     }
+    assert adapter._app_id is None
+    assert adapter._app_secret is None
 
     calls: list[tuple[str, str, str]] = []
 
@@ -285,6 +319,33 @@ async def test_formal_start_deliver_and_stop_use_controlled_provider_client() ->
     assert stop.resources_closed
     assert factory.client.closed
     assert stream.subscription is not None and stream.subscription.closed
+
+
+@pytest.mark.asyncio
+async def test_start_failure_does_not_join_unstarted_websocket_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = FakeProviderFactory()
+    stream = FakeTurnStream()
+    adapter = module.build_feishu_channel(_context(factory=factory, stream=stream))
+    adapter.attach_presentation(
+        ChannelPresentationPorts(control=FakeControl(), turn_stream=stream)
+    )
+
+    def fail_start(self: threading.Thread) -> None:
+        if self.name == "feishu-ws":
+            raise RuntimeError("thread start blocked")
+        raise AssertionError(f"unexpected thread: {self.name}")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="thread start blocked"):
+        await adapter.start()
+
+    assert factory.client.closed
+    assert adapter._ws_thread is None
+    assert not adapter._ws_thread_started
+    stop = await adapter.stop()
+    assert stop.resources_closed
 
 
 @pytest.mark.asyncio
@@ -416,6 +477,55 @@ async def test_text_inbound_admits_raw_message_and_attachment_is_rejected() -> N
         "",
     )
     assert rejected is DeliveryStatus.REJECTED
+    assert len(ingress.raw) == 1
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_inbound_and_control_are_fail_closed() -> None:
+    ingress = FakeIngress()
+    control = FakeControl()
+    stream = FakeTurnStream()
+    adapter = module.build_feishu_channel(
+        _context(
+            ingress=ingress,
+            control=control,
+            stream=stream,
+            config={"allowFrom": (), "domain": "https://example.test"},
+        )
+    )
+    adapter.attach_presentation(
+        ChannelPresentationPorts(control=control, turn_stream=stream)
+    )
+
+    inbound = await adapter._handle_message_event(_event())
+    control_attempt = await adapter._handle_message_event(
+        _event(content='{"text":"/stop"}')
+    )
+
+    assert inbound is DeliveryStatus.REJECTED
+    assert control_attempt is DeliveryStatus.REJECTED
+    assert ingress.raw == []
+    assert control.raw is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_allow_from_alias_reaches_inbound_allowlist() -> None:
+    ingress = FakeIngress()
+    stream = FakeTurnStream()
+    adapter = module.build_feishu_channel(
+        _context(
+            ingress=ingress,
+            stream=stream,
+            config={"allowFrom": ("ou_sender",), "domain": "https://example.test"},
+        )
+    )
+    adapter.attach_presentation(
+        ChannelPresentationPorts(control=FakeControl(), turn_stream=stream)
+    )
+
+    status = await adapter._handle_message_event(_event())
+
+    assert status is DeliveryStatus.DELIVERED
     assert len(ingress.raw) == 1
 
 

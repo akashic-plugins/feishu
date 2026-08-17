@@ -12,7 +12,7 @@ class FeishuConfig(BaseModel):
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
-        extra="ignore",
+        extra="forbid",
         validate_by_alias=True,
         validate_by_name=False,
     )
@@ -25,5 +25,8 @@ class FeishuConfig(BaseModel):
         CredentialRef | None,
         Field(validation_alias=AliasChoices("appSecret", "app_secret")),
     ] = None
-    allow_from: tuple[str, ...] = ()
+    allow_from: Annotated[
+        tuple[str, ...],
+        Field(validation_alias=AliasChoices("allow_from", "allowFrom")),
+    ] = ()
     domain: str = "https://open.feishu.cn"

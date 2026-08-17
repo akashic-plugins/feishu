@@ -140,6 +140,7 @@ class FeishuAdapter:
         self._ws_client: Any | None = None
         self._ws_loop: asyncio.AbstractEventLoop | None = None
         self._ws_thread: threading.Thread | None = None
+        self._ws_thread_started = False
         self._ws_stopped = threading.Event()
         self._sdk_logger: logging.Logger | None = None
         self._sdk_shutdown_filter: logging.Filter | None = None
@@ -175,8 +176,6 @@ class FeishuAdapter:
         try:
             # 1. Only the formal Host invokes ProviderClientFactory and unwraps refs.
             self._provider_client = await self._provider_factory.create(self._credentials)
-            self._app_id = self._read_credential("app_id")
-            self._app_secret = self._read_credential("app_secret")
             self._client = httpx.AsyncClient(timeout=30.0)
 
             # 2. Subscribe through the exact Core stream and keep admission closed.
@@ -190,7 +189,9 @@ class FeishuAdapter:
                 name="feishu-ws",
                 daemon=True,
             )
+            self._ws_thread_started = False
             self._ws_thread.start()
+            self._ws_thread_started = True
             self._started = True
             logger.info("[feishu] v3 channel started binding=%s", self._binding_token)
             return ChannelReady(
@@ -289,14 +290,18 @@ class FeishuAdapter:
         except BaseException as error:
             failures.append(self._cleanup_failure("websocket-disconnect", error))
         thread = self._ws_thread
-        if thread is not None:
+        if thread is not None and self._ws_thread_started:
             try:
                 await asyncio.to_thread(thread.join, _WS_STOP_TIMEOUT_S)
                 if thread.is_alive():
                     raise RuntimeError("飞书长连接线程停止超时")
                 self._ws_thread = None
+                self._ws_thread_started = False
             except BaseException as error:
                 failures.append(self._cleanup_failure("websocket-thread", error))
+        elif thread is not None:
+            self._ws_thread = None
+            self._ws_thread_started = False
         self._remove_sdk_shutdown_filter()
 
         # 3. Complete in-process callback cleanup before returning the receipt.
@@ -331,6 +336,7 @@ class FeishuAdapter:
             self._ws_client = None
             self._ws_loop = None
             self._ws_thread = None
+            self._ws_thread_started = False
             self._stream_subscription = None
             self._started = False
             self._stopping = False
@@ -372,8 +378,8 @@ class FeishuAdapter:
     def _build_ws_client(self) -> Any:
         """Create the Feishu SDK socket only after formal credential admission."""
 
-        if not self._app_id or not self._app_secret:
-            raise RuntimeError("Feishu websocket 缺少 formal credentials")
+        app_id = self._read_credential("app_id")
+        app_secret = self._read_credential("app_secret")
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
@@ -396,8 +402,8 @@ class FeishuAdapter:
             .build()
         )
         client = WsClient(
-            self._app_id,
-            self._app_secret,
+            app_id,
+            app_secret,
             log_level=LogLevel.INFO,
             event_handler=handler,
             domain=self._domain,
@@ -472,7 +478,7 @@ class FeishuAdapter:
         user_id = str(getattr(sender_id, "user_id", "") or "").strip()
         union_id = str(getattr(sender_id, "union_id", "") or "").strip()
         identities = {open_id, user_id, union_id} - {""}
-        if self._allow_from and not identities.intersection(self._allow_from):
+        if not self._allow_from or not identities.intersection(self._allow_from):
             logger.warning("[feishu] 拒绝未授权私聊用户 open_id=%s", open_id)
             return DeliveryStatus.REJECTED
         chat_id = str(getattr(message, "chat_id", "") or "").strip()
@@ -873,13 +879,15 @@ class FeishuAdapter:
         return value, "chat_id"
 
     async def _get_access_token(self) -> str:
-        if self._client is None or not self._app_id or not self._app_secret:
+        if self._client is None or self._provider_client is None:
             raise RuntimeError("Feishu formal credentials/client 未就绪")
         if self._token is not None and self._token.expires_at > time.time() + 60:
             return self._token.token
+        app_id = self._read_credential("app_id")
+        app_secret = self._read_credential("app_secret")
         response = await self._client.post(
             f"{self._domain}/open-apis/auth/v3/tenant_access_token/internal",
-            json={"app_id": self._app_id, "app_secret": self._app_secret},
+            json={"app_id": app_id, "app_secret": app_secret},
         )
         payload = self._check_response(response)
         token = str(payload.get("tenant_access_token") or "").strip()
@@ -940,8 +948,9 @@ class FeishuAdapter:
         except Exception:
             logger.debug("[feishu] start failure websocket cleanup failed", exc_info=True)
         thread = self._ws_thread
-        if thread is not None:
+        if thread is not None and self._ws_thread_started:
             await asyncio.to_thread(thread.join, _WS_STOP_TIMEOUT_S)
+        self._ws_thread_started = False
         self._remove_sdk_shutdown_filter()
         if self._stream_subscription is not None:
             try:
@@ -973,7 +982,7 @@ def _domain(config: Mapping[str, object]) -> str:
 
 
 def _allow_from(config: Mapping[str, object]) -> frozenset[str]:
-    value = config.get("allow_from", ())
+    value = config.get("allow_from", config.get("allowFrom", ()))
     if isinstance(value, str):
         return frozenset({value}) if value.strip() else frozenset()
     if not isinstance(value, (tuple, list)):
