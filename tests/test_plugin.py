@@ -119,8 +119,10 @@ class FakeControl:
 
 
 class FakeSubscription:
-    def __init__(self, callback) -> None:
+    def __init__(self, callback, *, fail_close_attempts: int = 0) -> None:
         self.callback = callback
+        self.fail_close_attempts = fail_close_attempts
+        self.close_calls = 0
         self.admission_closed = False
         self.closed = False
 
@@ -131,15 +133,22 @@ class FakeSubscription:
         return None
 
     async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_calls <= self.fail_close_attempts:
+            raise RuntimeError("stream close interrupted")
         self.closed = True
 
 
 class FakeTurnStream:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_close_attempts: int = 0) -> None:
+        self.fail_close_attempts = fail_close_attempts
         self.subscription: FakeSubscription | None = None
 
     def subscribe(self, callback) -> FakeSubscription:
-        self.subscription = FakeSubscription(callback)
+        self.subscription = FakeSubscription(
+            callback,
+            fail_close_attempts=self.fail_close_attempts,
+        )
         return self.subscription
 
 
@@ -346,6 +355,77 @@ async def test_start_failure_does_not_join_unstarted_websocket_thread(
     assert not adapter._ws_thread_started
     stop = await adapter.stop()
     assert stop.resources_closed
+
+
+@pytest.mark.asyncio
+async def test_start_failure_retains_stream_owner_for_later_close_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = FakeProviderFactory()
+    stream = FakeTurnStream(fail_close_attempts=1)
+    adapter = module.build_feishu_channel(_context(factory=factory, stream=stream))
+    adapter.attach_presentation(
+        ChannelPresentationPorts(control=FakeControl(), turn_stream=stream)
+    )
+
+    def fail_start(self: threading.Thread) -> None:
+        if self.name == "feishu-ws":
+            raise RuntimeError("thread start blocked")
+        raise AssertionError(f"unexpected thread: {self.name}")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="thread start blocked") as raised:
+        await adapter.start()
+
+    subscription = stream.subscription
+    assert subscription is not None
+    assert subscription.close_calls == 1
+    assert not subscription.closed
+    assert adapter._stream_subscription is subscription
+    assert any("stream close interrupted" in note for note in raised.value.__notes__)
+
+    receipt = await adapter.stop()
+    assert receipt.resources_closed
+    assert receipt.failures == ()
+    assert subscription.close_calls == 2
+    assert subscription.closed
+    assert adapter._stream_subscription is None
+
+
+@pytest.mark.asyncio
+async def test_persistent_start_cleanup_failure_keeps_stream_owner_and_reports_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = FakeProviderFactory()
+    stream = FakeTurnStream(fail_close_attempts=2)
+    adapter = module.build_feishu_channel(_context(factory=factory, stream=stream))
+    adapter.attach_presentation(
+        ChannelPresentationPorts(control=FakeControl(), turn_stream=stream)
+    )
+
+    def fail_start(self: threading.Thread) -> None:
+        if self.name == "feishu-ws":
+            raise RuntimeError("thread start blocked")
+        raise AssertionError(f"unexpected thread: {self.name}")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="thread start blocked"):
+        await adapter.start()
+
+    subscription = stream.subscription
+    assert subscription is not None
+    first_retry = await adapter.stop()
+    assert not first_retry.resources_closed
+    assert any(item.resource == "turn-stream" for item in first_retry.failures)
+    assert adapter._stream_subscription is subscription
+    assert not subscription.closed
+
+    second_retry = await adapter.stop()
+    assert second_retry.resources_closed
+    assert second_retry.failures == ()
+    assert subscription.close_calls == 3
+    assert subscription.closed
+    assert adapter._stream_subscription is None
 
 
 @pytest.mark.asyncio

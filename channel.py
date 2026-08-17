@@ -201,8 +201,16 @@ class FeishuAdapter:
                 subscriptions=("feishu.websocket", "feishu.turn_stream"),
                 admission_open=False,
             )
-        except BaseException:
-            await self._close_resources_after_start_failure()
+        except BaseException as error:
+            cleanup_failures = await self._close_resources_after_start_failure()
+            if cleanup_failures:
+                error.add_note(
+                    "Feishu start cleanup failed: "
+                    + "; ".join(
+                        str(failure) or type(failure).__name__
+                        for failure in cleanup_failures
+                    )
+                )
             raise
 
     async def deliver(self, request: ProviderDeliveryRequest) -> ProviderDeliveryReceipt:
@@ -943,37 +951,65 @@ class FeishuAdapter:
             retry_action="retry_generation_cleanup",
         )
 
-    async def _close_resources_after_start_failure(self) -> None:
+    async def _close_resources_after_start_failure(self) -> tuple[BaseException, ...]:
+        """Release start-owned resources while retaining every failed owner for retry."""
+
+        failures: list[BaseException] = []
         self._ws_stopped.set()
         try:
             await self._disconnect_ws()
-        except Exception:
-            logger.debug("[feishu] start failure websocket cleanup failed", exc_info=True)
+        except BaseException as error:
+            failures.append(error)
+        else:
+            self._ws_client = None
+            self._ws_loop = None
         thread = self._ws_thread
         if thread is not None and self._ws_thread_started:
-            await asyncio.to_thread(thread.join, _WS_STOP_TIMEOUT_S)
-        self._ws_thread_started = False
-        self._remove_sdk_shutdown_filter()
-        if self._stream_subscription is not None:
             try:
-                self._stream_subscription.close_admission()
-                await self._stream_subscription.await_quiescence()
-                await self._stream_subscription.close()
-            except Exception:
-                logger.debug("[feishu] start failure stream cleanup failed", exc_info=True)
-        if self._client is not None:
-            await self._client.aclose()
-        if self._provider_client is not None:
-            await self._provider_client.aclose()
-        self._client = None
-        self._provider_client = None
-        self._stream_subscription = None
-        self._ws_client = None
-        self._ws_loop = None
-        self._ws_thread = None
+                await asyncio.to_thread(thread.join, _WS_STOP_TIMEOUT_S)
+                if thread.is_alive():
+                    raise RuntimeError("飞书长连接线程停止超时")
+            except BaseException as error:
+                failures.append(error)
+            else:
+                self._ws_thread = None
+                self._ws_thread_started = False
+        elif thread is not None:
+            self._ws_thread = None
+            self._ws_thread_started = False
+        self._remove_sdk_shutdown_filter()
+        subscription = self._stream_subscription
+        if subscription is not None:
+            try:
+                subscription.close_admission()
+                await subscription.await_quiescence()
+                await subscription.close()
+            except BaseException as error:
+                failures.append(error)
+            else:
+                self._stream_subscription = None
+        client = self._client
+        if client is not None:
+            try:
+                await client.aclose()
+            except BaseException as error:
+                failures.append(error)
+            else:
+                self._client = None
+        provider_client = self._provider_client
+        if provider_client is not None:
+            try:
+                await provider_client.aclose()
+            except BaseException as error:
+                failures.append(error)
+            else:
+                self._provider_client = None
+        if failures:
+            self._stopping = True
         self._app_id = None
         self._app_secret = None
         self._token = None
+        return tuple(failures)
 
 
 def _domain(config: Mapping[str, object]) -> str:
