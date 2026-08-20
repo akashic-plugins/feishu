@@ -67,6 +67,9 @@ _CREDENTIAL_ALIASES = {
     "app_secret": ("appSecret", "app_secret"),
 }
 _MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+_MAX_ATTACHMENT_COUNT = 16
+_MAX_ATTACHMENT_BATCH_BYTES = 100 * 1024 * 1024
+_MAX_PROVIDER_SEGMENT_LENGTH = 256
 
 
 @dataclass(slots=True)
@@ -141,6 +144,8 @@ class FeishuAdapter:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._started = False
         self._stopping = False
+        self._admission_open = False
+        self._runtime: Any | None = None
 
         self._ws_client: Any | None = None
         self._ws_loop: asyncio.AbstractEventLoop | None = None
@@ -169,6 +174,29 @@ class FeishuAdapter:
         if ports.control is None or ports.turn_stream is None:
             raise RuntimeError("Feishu v3 必须同时绑定 control 与 turn_stream")
         self._presentation = ports
+
+    def attach_runtime(self, runtime: Any) -> None:
+        """Bind the exact Host runtime lifecycle owner without replacing context ports."""
+
+        if self._runtime is not None:
+            raise RuntimeError("Feishu runtime 不能重复绑定")
+        if runtime is None:
+            raise TypeError("Feishu runtime 不能为空")
+        if getattr(runtime, "binding_token", None) != self._binding_token:
+            raise RuntimeError("Feishu runtime binding token 不匹配")
+        self._runtime = runtime
+
+    def open_admission(self) -> None:
+        """Allow provider ingress only after Core has published this binding."""
+
+        if self._stopping:
+            raise RuntimeError("Feishu adapter 正在停止")
+        self._admission_open = True
+
+    def close_admission(self) -> None:
+        """Reject new provider ingress while accepted callback tasks drain."""
+
+        self._admission_open = False
 
     async def start(self) -> ChannelReady:
         """Resolve formal credentials, create the provider client, and start closed."""
@@ -248,6 +276,7 @@ class FeishuAdapter:
 
         # 2. Split before provider effect; every chunk retains the same delivery id.
         provider_ids: list[str] = []
+        delivered_any = False
         if request.body.strip():
             for chunk in _split_markdown(request.body, _CARD_TEXT_LIMIT):
                 status, provider_id, error = await self._send_one(
@@ -264,7 +293,11 @@ class FeishuAdapter:
                     )
                 if provider_id:
                     provider_ids.append(provider_id)
+                if status is DeliveryStatus.DELIVERED:
+                    delivered_any = True
                 if status is not DeliveryStatus.DELIVERED:
+                    if delivered_any and status is DeliveryStatus.REJECTED:
+                        status = DeliveryStatus.UNKNOWN
                     return ProviderDeliveryReceipt(
                         request.delivery_id,
                         status,
@@ -280,8 +313,10 @@ class FeishuAdapter:
             )
             if provider_id:
                 provider_ids.append(provider_id)
+            if status is DeliveryStatus.DELIVERED:
+                delivered_any = True
             if status is not DeliveryStatus.DELIVERED:
-                if provider_ids and status is DeliveryStatus.REJECTED:
+                if delivered_any and status is DeliveryStatus.REJECTED:
                     status = DeliveryStatus.UNKNOWN
                 return ProviderDeliveryReceipt(
                     request.delivery_id,
@@ -303,10 +338,16 @@ class FeishuAdapter:
 
         if not refs:
             return []
+        if len(refs) > _MAX_ATTACHMENT_COUNT:
+            raise ValueError("Feishu 附件数量超过上限")
+        declared_total = sum(ref.size_bytes for ref in refs)
+        if declared_total > _MAX_ATTACHMENT_BATCH_BYTES:
+            raise ValueError("Feishu 附件批次超过总大小上限")
         attachment_read = self._context.attachment_read
         if attachment_read is None:
             raise RuntimeError("Feishu outbound 附件缺少 Core attachment_read")
         result: list[tuple[AttachmentRef, bytes]] = []
+        actual_total = 0
         for ref in refs:
             lease = await attachment_read.acquire(ref)
             try:
@@ -321,6 +362,9 @@ class FeishuAdapter:
                     )
                 if hashlib.sha256(data).hexdigest() != ref.sha256:
                     raise ValueError("附件 sha256 不匹配")
+                actual_total += len(data)
+                if actual_total > _MAX_ATTACHMENT_BATCH_BYTES:
+                    raise ValueError("Feishu 附件批次超过总大小上限")
                 result.append((ref, data))
             finally:
                 await _close_attachment_lease(lease)
@@ -338,6 +382,8 @@ class FeishuAdapter:
             provider_key = await self._upload_attachment(ref, data)
         except asyncio.CancelledError:
             raise
+        except ValueError as error:
+            return DeliveryStatus.REJECTED, None, str(error)
         except Exception as error:
             return _feishu_error_status(error), None, str(error) or type(error).__name__
         try:
@@ -360,6 +406,10 @@ class FeishuAdapter:
         provider_id = str(payload.get("message_id") or "").strip()
         if not provider_id:
             return DeliveryStatus.UNKNOWN, None, "Feishu response 缺少 message_id"
+        try:
+            _provider_segment(provider_id, "Feishu message_id")
+        except ValueError as error:
+            return DeliveryStatus.UNKNOWN, None, str(error)
         return DeliveryStatus.DELIVERED, provider_id, None
 
     async def _upload_attachment(self, ref: AttachmentRef, data: bytes) -> str:
@@ -371,6 +421,7 @@ class FeishuAdapter:
             provider_key = await self._upload_file(data, ref.filename or "attachment")
         if not provider_key:
             raise RuntimeError("Feishu media upload response 缺少 provider key")
+        _provider_segment(provider_key, "Feishu file_key")
         return provider_key
 
     async def stop(self) -> StopReceipt:
@@ -402,6 +453,7 @@ class FeishuAdapter:
 
         # 2. Stop the provider receive loop before closing its HTTP resources.
         self._ws_stopped.set()
+        self._admission_open = False
         try:
             await self._disconnect_ws()
             self._ws_client = None
@@ -425,11 +477,14 @@ class FeishuAdapter:
 
         # 3. Complete in-process callback cleanup before returning the receipt.
         tasks = tuple(self._inbound_tasks)
-        for task in tasks:
-            task.cancel()
         try:
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException) and not isinstance(
+                        result, asyncio.CancelledError
+                    ):
+                        failures.append(self._cleanup_failure("inbound-task", result))
         finally:
             self._inbound_tasks.clear()
             self._clear_transient_state()
@@ -567,12 +622,12 @@ class FeishuAdapter:
 
     def _on_sdk_message(self, event: Any) -> None:
         loop = self._loop
-        if loop is None or self._ws_stopped.is_set():
+        if loop is None or self._ws_stopped.is_set() or not self._admission_open:
             return
         loop.call_soon_threadsafe(self._start_inbound_task, event)
 
     def _start_inbound_task(self, event: Any) -> None:
-        if self._ws_stopped.is_set():
+        if self._ws_stopped.is_set() or not self._admission_open:
             return
         task = asyncio.create_task(
             self._handle_message_event(event),
@@ -584,6 +639,10 @@ class FeishuAdapter:
     async def _handle_message_event(self, event: Any) -> DeliveryStatus | None:
         """Project one SDK event into text ingress or an exact Core control port."""
 
+        if not self._admission_open:
+            logger.warning("[feishu] Core admission 尚未打开，拒绝 provider 入站")
+            return DeliveryStatus.REJECTED
+
         data = getattr(event, "event", None)
         message = getattr(data, "message", None)
         sender = getattr(data, "sender", None)
@@ -594,6 +653,11 @@ class FeishuAdapter:
         message_id = str(getattr(message, "message_id", "") or "").strip()
         if not message_id:
             logger.warning("[feishu] 丢弃缺少 provider message id 的事件")
+            return DeliveryStatus.REJECTED
+        try:
+            _provider_segment(message_id, "Feishu message_id")
+        except ValueError as error:
+            logger.warning("[feishu] 丢弃非法 provider message id: %s", error)
             return DeliveryStatus.REJECTED
         sender_id = getattr(sender, "sender_id", None)
         open_id = str(getattr(sender_id, "open_id", "") or "").strip()
@@ -626,11 +690,53 @@ class FeishuAdapter:
     ) -> DeliveryStatus:
         """Download provider media into Core artifacts before one ingress admission."""
 
+        # 1. Decide /stop before touching provider media. An attachment-bearing
+        # control message is rejected without creating a Core artifact.
+        stop_candidate, has_media = _stop_candidate(message)
+        if stop_candidate.strip() == "/stop":
+            if has_media:
+                logger.warning(
+                    "[feishu] 拒绝带附件的 /stop message_id=%s",
+                    message_id,
+                )
+                return DeliveryStatus.REJECTED
+            sender = open_id or user_id or union_id
+            if not sender:
+                return DeliveryStatus.REJECTED
+            raw = RawInbound(
+                message_id=message_id,
+                message=ChannelInboundMessage(
+                    channel=_CHANNEL,
+                    sender=sender,
+                    chat_id=chat_id,
+                    content="/stop",
+                    timestamp=_message_timestamp(message),
+                    metadata={
+                        "chat_type": "private",
+                        "provider_message_id": message_id,
+                        "open_id": open_id,
+                        "user_id": user_id,
+                        "union_id": union_id,
+                    },
+                ),
+                provider_identity=sender,
+                recipient=chat_id,
+            )
+            return await self._interrupt(raw)
+
+        # 2. Download and import only ordinary inbound messages.
         try:
             content, attachments = await self._extract_inbound_payload(message, message_id)
         except asyncio.CancelledError:
             raise
-        except (httpx.HTTPStatusError, FeishuApiError, RuntimeError, TypeError, ValueError) as error:
+        except (
+            httpx.HTTPStatusError,
+            httpx.RequestError,
+            FeishuApiError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
             logger.warning(
                 "[feishu] 入站附件未能导入 message_id=%s err=%s",
                 message_id,
@@ -697,6 +803,7 @@ class FeishuAdapter:
         if message_type == "image":
             image_key = _extract_key(content_raw, "image_key")
             data = await self._download_resource_bytes(message_id, image_key, "image")
+            _check_inbound_batch((data,))
             return "[图片]", [
                 await self._import_inbound_attachment(
                     data,
@@ -709,6 +816,7 @@ class FeishuAdapter:
             file_name = _extract_key(content_raw, "file_name") or "file"
             file_key = _extract_key(content_raw, "file_key")
             data = await self._download_resource_bytes(message_id, file_key, "file")
+            _check_inbound_batch((data,))
             media_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
             return f"[文件: {file_name}]", [
                 await self._import_inbound_attachment(
@@ -720,9 +828,15 @@ class FeishuAdapter:
             ]
         if message_type == "post":
             text, image_keys = _extract_post(content_raw)
+            if len(image_keys) > _MAX_ATTACHMENT_COUNT:
+                raise ValueError("Feishu 入站附件数量超过上限")
             attachments: list[AttachmentRef] = []
+            downloaded: list[bytes] = []
             for index, image_key in enumerate(image_keys, start=1):
                 data = await self._download_resource_bytes(message_id, image_key, "image")
+                downloaded.append(data)
+            _check_inbound_batch(downloaded)
+            for index, data in enumerate(downloaded, start=1):
                 attachments.append(
                     await self._import_inbound_attachment(
                         data,
@@ -743,18 +857,20 @@ class FeishuAdapter:
     ) -> bytes:
         """Download one provider resource with a fixed memory bound."""
 
-        if not file_key:
-            raise ValueError("Feishu 资源缺少 provider key")
+        _provider_segment(message_id, "Feishu message_id")
+        _provider_segment(file_key, "Feishu file_key")
         if self._client is None:
             raise RuntimeError("Feishu HTTP client 尚未 start")
         token = await self._get_access_token()
-        response = await self._client.get(
+        async with self._client.stream(
+            "GET",
             f"{self._domain}/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
             params={"type": resource_type},
             headers={"Authorization": f"Bearer {token}"},
-        )
-        response.raise_for_status()
-        return await _bounded_response_bytes(response)
+            follow_redirects=False,
+        ) as response:
+            response.raise_for_status()
+            return await _bounded_response_bytes(response)
 
     async def _import_inbound_attachment(
         self,
@@ -1010,6 +1126,8 @@ class FeishuAdapter:
             payload = await self._post_message_once(recipient, message_type, content)
         except asyncio.CancelledError:
             raise
+        except ValueError as error:
+            return DeliveryStatus.REJECTED, None, str(error)
         except httpx.HTTPStatusError as error:
             status = error.response.status_code
             if status in _REJECTED_HTTP_STATUSES:
@@ -1019,11 +1137,17 @@ class FeishuAdapter:
             if error.code in _RATE_LIMIT_CODES:
                 return DeliveryStatus.UNKNOWN, None, str(error)
             return DeliveryStatus.REJECTED, None, str(error)
+        except httpx.RequestError as error:
+            return _feishu_error_status(error), None, str(error) or type(error).__name__
         except Exception as error:
             return DeliveryStatus.UNKNOWN, None, str(error) or type(error).__name__
         provider_id = str(payload.get("message_id") or "").strip()
         if not provider_id:
             return DeliveryStatus.UNKNOWN, None, "Feishu response 缺少 message_id"
+        try:
+            _provider_segment(provider_id, "Feishu message_id")
+        except ValueError as error:
+            return DeliveryStatus.UNKNOWN, None, str(error)
         return DeliveryStatus.DELIVERED, provider_id, None
 
     async def _patch_one(
@@ -1032,6 +1156,7 @@ class FeishuAdapter:
         content: str,
     ) -> tuple[DeliveryStatus, str | None]:
         try:
+            _provider_segment(message_id, "Feishu message_id")
             await self._patch_message_once(message_id, content)
         except asyncio.CancelledError:
             raise
@@ -1115,6 +1240,7 @@ class FeishuAdapter:
         if self._client is None:
             return ""
         try:
+            _provider_segment(message_id, "Feishu message_id")
             token = await self._get_access_token()
             response = await self._client.get(
                 f"{self._domain}/open-apis/im/v1/messages/{message_id}",
@@ -1138,11 +1264,13 @@ class FeishuAdapter:
         value = recipient.strip()
         if value.startswith(f"{_CHANNEL}:"):
             value = value[len(_CHANNEL) + 1 :]
+        _provider_segment(value, "Feishu recipient")
         if value.startswith("oc_"):
             return value, "chat_id"
         if self._identity is not None:
             resolved = self._identity.resolve(value)
             if resolved:
+                _provider_segment(resolved, "Feishu resolved recipient")
                 return resolved, "chat_id"
         if value.startswith("ou_"):
             return value, "open_id"
@@ -1290,6 +1418,51 @@ def _allow_from(config: Mapping[str, object]) -> frozenset[str]:
     return frozenset(item.strip() for item in value if isinstance(item, str) and item.strip())
 
 
+def _provider_segment(value: object, field_name: str) -> str:
+    """Validate an opaque provider value before putting it in a path or request."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} 不能为空")
+    if value != value.strip():
+        raise ValueError(f"{field_name} 不能包含首尾空白")
+    if len(value) > _MAX_PROVIDER_SEGMENT_LENGTH:
+        raise ValueError(f"{field_name} 超过长度上限")
+    if "/" in value or "\\" in value:
+        raise ValueError(f"{field_name} 不能包含路径分隔符")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{field_name} 不能包含控制字符")
+    return value
+
+
+def _check_inbound_batch(data: tuple[bytes, ...] | list[bytes]) -> None:
+    """Enforce inbound attachment count and aggregate byte limits before import."""
+
+    if len(data) > _MAX_ATTACHMENT_COUNT:
+        raise ValueError("Feishu 入站附件数量超过上限")
+    total = 0
+    for item in data:
+        if not isinstance(item, bytes):
+            raise TypeError("Feishu 入站附件必须是 bytes")
+        total += len(item)
+    if total > _MAX_ATTACHMENT_BATCH_BYTES:
+        raise ValueError("Feishu 入站附件批次超过总大小上限")
+
+
+def _stop_candidate(message: Any) -> tuple[str, bool]:
+    """Extract control text and media presence without downloading provider bytes."""
+
+    message_type = str(getattr(message, "message_type", "") or "")
+    content = str(getattr(message, "content", "") or "")
+    if message_type == "text":
+        return _extract_text(content), False
+    if message_type in {"image", "file"}:
+        return "", True
+    if message_type == "post":
+        text, image_keys = _extract_post(content)
+        return text, bool(image_keys)
+    return "", False
+
+
 def _message_timestamp(message: Any) -> datetime:
     raw = getattr(message, "create_time", None)
     try:
@@ -1430,7 +1603,24 @@ def _feishu_error_status(error: BaseException) -> DeliveryStatus:
             if error.code in _RATE_LIMIT_CODES
             else DeliveryStatus.REJECTED
         )
+    if isinstance(error, httpx.RequestError) and _is_pre_effect_request_error(error):
+        return DeliveryStatus.REJECTED
     return DeliveryStatus.UNKNOWN
+
+
+def _is_pre_effect_request_error(error: httpx.RequestError) -> bool:
+    """Classify connection setup failures that cannot have reached Feishu."""
+
+    return isinstance(
+        error,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ProxyError,
+            httpx.UnsupportedProtocol,
+            httpx.InvalidURL,
+        ),
+    )
 
 
 async def _close_attachment_lease(lease: Any) -> None:
@@ -1458,19 +1648,14 @@ async def _bounded_response_bytes(response: Any) -> bytes:
     chunks: list[bytes] = []
     total = 0
     aiter_bytes = getattr(response, "aiter_bytes", None)
-    if callable(aiter_bytes):
-        aiter_bytes = cast(Callable[[], AsyncIterable[bytes]], aiter_bytes)
-        async for chunk in aiter_bytes():
-            if not isinstance(chunk, bytes):
-                raise TypeError("Feishu provider response chunk 必须是 bytes")
-            total += len(chunk)
-            if total > _MAX_ATTACHMENT_BYTES:
-                raise ValueError("Feishu 入站附件超过大小上限")
-            chunks.append(chunk)
-        return b"".join(chunks)
-    data = response.content
-    if not isinstance(data, bytes):
-        raise TypeError("Feishu provider response content 必须是 bytes")
-    if len(data) > _MAX_ATTACHMENT_BYTES:
-        raise ValueError("Feishu 入站附件超过大小上限")
-    return data
+    if not callable(aiter_bytes):
+        raise TypeError("Feishu provider response 必须提供 aiter_bytes")
+    aiter_bytes = cast(Callable[[], AsyncIterable[bytes]], aiter_bytes)
+    async for chunk in aiter_bytes():
+        if not isinstance(chunk, bytes):
+            raise TypeError("Feishu provider response chunk 必须是 bytes")
+        total += len(chunk)
+        if total > _MAX_ATTACHMENT_BYTES:
+            raise ValueError("Feishu 入站附件超过大小上限")
+        chunks.append(chunk)
+    return b"".join(chunks)

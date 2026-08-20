@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.util
+import json
 import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 
 from agent.plugin_composition.channels import (
     AttachmentKind,
@@ -684,6 +686,175 @@ async def test_delivery_fallback_only_runs_after_deterministic_card_rejection() 
 
 
 @pytest.mark.asyncio
+async def test_delivery_after_prior_success_aggregates_later_rejection_as_unknown() -> None:
+    adapter = module.build_feishu_channel(_context())
+    adapter._client = object()
+    first = AttachmentRef(
+        "aggregate-1",
+        AttachmentKind.FILE,
+        "a.txt",
+        "text/plain",
+        1,
+        hashlib.sha256(b"a").hexdigest(),
+    )
+    second = AttachmentRef(
+        "aggregate-2",
+        AttachmentKind.FILE,
+        "b.txt",
+        "text/plain",
+        1,
+        hashlib.sha256(b"b").hexdigest(),
+    )
+
+    async def read(_refs):
+        return [(first, b"a"), (second, b"b")]
+
+    outcomes = iter(
+        [
+            (DeliveryStatus.DELIVERED, "provider-1", None),
+            (DeliveryStatus.REJECTED, None, "HTTP 400"),
+        ]
+    )
+
+    async def send(_recipient, _ref, _data):
+        return next(outcomes)
+
+    adapter._read_attachments = read
+    adapter._send_attachment = send
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            "binding-1", "aggregate-delivery", "oc_chat", "", (first, second)
+        )
+    )
+    assert receipt.status is DeliveryStatus.UNKNOWN
+    assert receipt.provider_ids == ("provider-1",)
+
+
+@pytest.mark.asyncio
+async def test_connection_setup_error_is_rejected_before_any_feishu_effect() -> None:
+    adapter = module.build_feishu_channel(_context())
+    adapter._client = object()
+
+    async def fail_connect(*_args, **_kwargs):
+        raise httpx.ConnectError("connect failed")
+
+    adapter._post_message_once = fail_connect
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest("binding-1", "connect-error", "oc_chat", "hello")
+    )
+    assert receipt.status is DeliveryStatus.REJECTED
+
+
+@pytest.mark.asyncio
+async def test_inbound_download_streams_and_enforces_bound_before_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module.channel, "_MAX_ATTACHMENT_BYTES", 3)
+    adapter = module.build_feishu_channel(_context())
+    calls: list[tuple[str, str]] = []
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_bytes(self):
+            yield b"xx"
+            yield b"xx"
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Client:
+        def stream(self, method: str, url: str, **kwargs):
+            calls.append((method, url))
+            assert kwargs["follow_redirects"] is False
+            return Stream()
+
+    async def token() -> str:
+        return "token"
+
+    adapter._client = Client()
+    adapter._get_access_token = token
+    with pytest.raises(ValueError, match="超过大小上限"):
+        await adapter._download_resource_bytes("message-1", "file-1", "file")
+    assert calls == [
+        (
+            "GET",
+            "https://example.test/open-apis/im/v1/messages/message-1/resources/file-1",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_lifecycle_rejects_before_open_and_stop_drains_accepted_task() -> None:
+    adapter = module.build_feishu_channel(_context())
+    context = adapter._context
+    adapter.attach_runtime(SimpleNamespace(binding_token=context.binding_token))
+    adapter.open_admission()
+    adapter.close_admission()
+    assert not adapter._admission_open
+
+    released = asyncio.Event()
+
+    async def accepted_before_close() -> None:
+        await released.wait()
+
+    task = asyncio.create_task(accepted_before_close())
+    adapter._inbound_tasks.add(task)
+    task.add_done_callback(adapter._inbound_tasks.discard)
+    stopping = asyncio.create_task(adapter.stop())
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    released.set()
+    assert (await stopping).resources_closed
+
+
+@pytest.mark.asyncio
+async def test_feishu_stop_with_post_attachment_rejects_before_import() -> None:
+    control = FakeControl()
+    imported = FakeAttachmentImport()
+    adapter = module.build_feishu_channel(
+        _context(control=control, attachment_import=imported)
+    )
+    message = _message(
+        message_type="post",
+        content=json.dumps(
+            {
+                "title": "/stop",
+                "content": [[{"tag": "img", "image_key": "image-key"}]],
+            }
+        ),
+    )
+
+    async def fail_download(*_args):
+        raise AssertionError("带附件 /stop 不得下载 provider media")
+
+    adapter._download_resource_bytes = fail_download
+    status = await adapter._ingest_message(
+        message, "stop-media", "oc_chat", "ou_sender", "", ""
+    )
+    assert status is DeliveryStatus.REJECTED
+    assert imported.calls == []
+    assert control.raw is None
+
+
+@pytest.mark.asyncio
+async def test_feishu_invalid_recipient_path_is_rejected_before_provider_call() -> None:
+    adapter = module.build_feishu_channel(_context())
+    adapter._client = object()
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest(
+            "binding-1", "invalid-recipient", "oc_chat/escape", "hello"
+        )
+    )
+    assert receipt.status is DeliveryStatus.REJECTED
+
+
+@pytest.mark.asyncio
 async def test_text_and_image_inbound_import_core_attachment_before_admission() -> None:
     ingress = FakeIngress()
     stream = FakeTurnStream()
@@ -759,6 +930,7 @@ async def test_legacy_allow_from_alias_reaches_inbound_allowlist() -> None:
     adapter.attach_presentation(
         ChannelPresentationPorts(control=FakeControl(), turn_stream=stream)
     )
+    adapter.open_admission()
 
     status = await adapter._handle_message_event(_event())
 
