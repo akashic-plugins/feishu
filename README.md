@@ -5,9 +5,12 @@ inbound admission, identity mapping, `/stop`, turn-stream lifecycle, delivery
 identity, and persistent state; this repository only translates Feishu's
 provider protocol.
 
-The first v3 adapter is deliberately text-only. Incoming and outgoing image,
-file, and rich-post attachments are returned as deterministic `REJECTED`
-without reading a workspace path, importing bytes, or uploading provider data.
+The v3 adapter accepts Core-owned image and file references for outbound delivery:
+it verifies the exact reference and bounded bytes before Feishu upload, then
+sends text and attachments in request order. Incoming image, file, and rich-post
+media are downloaded through the provider API and imported into Core's artifact
+store before one ingress admission. Provider effects use `DELIVERED`,
+`REJECTED`, and `UNKNOWN` without exposing workspace paths.
 The previous v2 installation and its data remain available for an explicit,
 append-only migration; no v2 class or ABI is loaded by this artifact.
 Feishu owns no plugin database or attachment store, so this migration has no

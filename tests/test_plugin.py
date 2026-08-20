@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import sys
 import threading
@@ -10,6 +11,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent.plugin_composition.channels import (
+    AttachmentKind,
+    AttachmentRef,
     ChannelDeliveryReceipt,
     ChannelFactoryContext,
     ChannelInboundMessage,
@@ -152,6 +155,58 @@ class FakeTurnStream:
         return self.subscription
 
 
+class FakeAttachmentReadLease:
+    def __init__(self, ref: AttachmentRef, data: bytes) -> None:
+        self.ref = ref
+        self.data = data
+        self.closed = False
+        self.max_bytes: int | None = None
+
+    async def read_bytes(self, *, max_bytes: int) -> bytes:
+        self.max_bytes = max_bytes
+        if len(self.data) > max_bytes:
+            raise ValueError("read exceeded bound")
+        return self.data
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class FakeAttachmentRead:
+    def __init__(self, values: dict[str, tuple[AttachmentRef, bytes]] | None = None) -> None:
+        self.values = values or {}
+        self.leases: list[FakeAttachmentReadLease] = []
+
+    async def acquire(self, ref: AttachmentRef) -> FakeAttachmentReadLease:
+        actual_ref, data = self.values.get(ref.artifact_id, (ref, b""))
+        lease = FakeAttachmentReadLease(actual_ref, data)
+        self.leases.append(lease)
+        return lease
+
+
+class FakeAttachmentImport:
+    def __init__(self) -> None:
+        self.calls: list[tuple[bytes, AttachmentKind, str | None, str | None]] = []
+
+    async def import_bytes(
+        self,
+        data: bytes,
+        *,
+        kind: AttachmentKind,
+        filename: str | None,
+        media_type: str | None,
+    ) -> AttachmentRef:
+        self.calls.append((data, kind, filename, media_type))
+        return AttachmentRef(
+            artifact_id=f"imported-{len(self.calls)}",
+            kind=kind,
+            filename=filename,
+            media_type=media_type,
+            size_bytes=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+        )
+
+
 def _context(
     *,
     factory: FakeProviderFactory | None = None,
@@ -159,6 +214,8 @@ def _context(
     identity: FakeIdentity | None = None,
     control: FakeControl | None = None,
     stream: FakeTurnStream | None = None,
+    attachment_read: FakeAttachmentRead | None = None,
+    attachment_import: FakeAttachmentImport | None = None,
     config: dict[str, object] | None = None,
 ) -> ChannelFactoryContext:
     return ChannelFactoryContext(
@@ -177,6 +234,8 @@ def _context(
         provider_client_factory=factory or FakeProviderFactory(),
         ingress=ingress or FakeIngress(),
         identity=identity or FakeIdentity(),
+        attachment_import=attachment_import or FakeAttachmentImport(),
+        attachment_read=attachment_read or FakeAttachmentRead(),
         control=control or FakeControl(),
         turn_stream=stream or FakeTurnStream(),
     )
@@ -463,23 +522,41 @@ async def test_stop_failure_retains_provider_owner_for_exact_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_attachment_delivery_is_deterministic_rejected_without_provider_effect() -> None:
+async def test_attachment_delivery_reads_exact_bytes_and_preserves_text_file_order() -> None:
     factory = FakeProviderFactory()
     stream = FakeTurnStream()
-    adapter = module.build_feishu_channel(_context(factory=factory, stream=stream))
-    adapter.attach_presentation(
-        ChannelPresentationPorts(control=FakeControl(), turn_stream=stream)
-    )
-    from agent.plugin_composition.channels import AttachmentKind, AttachmentRef
-
+    data = b"x"
     attachment = AttachmentRef(
         artifact_id="artifact-1",
         kind=AttachmentKind.FILE,
         filename="a.txt",
         media_type="text/plain",
-        size_bytes=1,
-        sha256="0" * 64,
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
     )
+    read = FakeAttachmentRead({attachment.artifact_id: (attachment, data)})
+    adapter = module.build_feishu_channel(
+        _context(factory=factory, stream=stream, attachment_read=read)
+    )
+    adapter._run_ws_client = lambda: adapter._ws_stopped.wait()
+    adapter.attach_presentation(
+        ChannelPresentationPorts(control=FakeControl(), turn_stream=stream)
+    )
+    await adapter.start()
+    calls: list[tuple[str, str]] = []
+
+    async def post(recipient: str, message_type: str, content: str):
+        calls.append(("post", message_type))
+        return {"message_id": f"provider-{len(calls)}"}
+
+    async def upload(data: bytes, filename: str):
+        assert data == b"x"
+        assert filename == "a.txt"
+        calls.append(("upload", filename))
+        return "file-key"
+
+    adapter._post_message_once = post
+    adapter._upload_file = upload
     receipt = await adapter.deliver(
         ProviderDeliveryRequest(
             binding_token="binding-1",
@@ -489,8 +566,81 @@ async def test_attachment_delivery_is_deterministic_rejected_without_provider_ef
             attachments=(attachment,),
         )
     )
+    assert receipt.status is DeliveryStatus.DELIVERED
+    assert calls == [("post", "interactive"), ("upload", "a.txt"), ("post", "file")]
+    assert read.leases[0].max_bytes == 1
+    assert read.leases[0].closed
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_attachment_upload_failure_is_rejected_without_attachment_message() -> None:
+    stream = FakeTurnStream()
+    data = b"x"
+    attachment = AttachmentRef(
+        artifact_id="artifact-failure",
+        kind=AttachmentKind.FILE,
+        filename="a.txt",
+        media_type="text/plain",
+        size_bytes=1,
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+    adapter = module.build_feishu_channel(
+        _context(
+            stream=stream,
+            attachment_read=FakeAttachmentRead({"artifact-failure": (attachment, data)}),
+        )
+    )
+    adapter._run_ws_client = lambda: adapter._ws_stopped.wait()
+    adapter.attach_presentation(ChannelPresentationPorts(FakeControl(), stream))
+    await adapter.start()
+    calls: list[str] = []
+
+    async def post(recipient: str, message_type: str, content: str):
+        calls.append(message_type)
+        return {"message_id": "text-id"}
+
+    async def upload(data: bytes, filename: str):
+        raise module.channel.FeishuApiError(123, "invalid media")
+
+    adapter._post_message_once = post
+    adapter._upload_file = upload
+    receipt = await adapter.deliver(
+        ProviderDeliveryRequest("binding-1", "delivery-failure", "oc_chat", "", (attachment,))
+    )
     assert receipt.status is DeliveryStatus.REJECTED
-    assert factory.create_calls == 0
+    assert calls == []
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_attachment_delivery_propagates_cancel_and_closes_read_lease() -> None:
+    stream = FakeTurnStream()
+    data = b"x"
+    attachment = AttachmentRef(
+        artifact_id="artifact-cancel",
+        kind=AttachmentKind.FILE,
+        filename="a.txt",
+        media_type="text/plain",
+        size_bytes=1,
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+    read = FakeAttachmentRead({"artifact-cancel": (attachment, data)})
+    adapter = module.build_feishu_channel(_context(stream=stream, attachment_read=read))
+    adapter._run_ws_client = lambda: adapter._ws_stopped.wait()
+    adapter.attach_presentation(ChannelPresentationPorts(FakeControl(), stream))
+    await adapter.start()
+
+    async def upload(data: bytes, filename: str):
+        raise asyncio.CancelledError
+
+    adapter._upload_file = upload
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.deliver(
+            ProviderDeliveryRequest("binding-1", "delivery-cancel", "oc_chat", "", (attachment,))
+        )
+    assert read.leases[0].closed
+    await adapter.stop()
 
 
 @pytest.mark.asyncio
@@ -534,7 +684,7 @@ async def test_delivery_fallback_only_runs_after_deterministic_card_rejection() 
 
 
 @pytest.mark.asyncio
-async def test_text_inbound_admits_raw_message_and_attachment_is_rejected() -> None:
+async def test_text_and_image_inbound_import_core_attachment_before_admission() -> None:
     ingress = FakeIngress()
     stream = FakeTurnStream()
     adapter = module.build_feishu_channel(_context(ingress=ingress, stream=stream))
@@ -548,7 +698,12 @@ async def test_text_inbound_admits_raw_message_and_attachment_is_rejected() -> N
     assert ingress.raw[0].provider_identity == "ou_sender"
     assert ingress.raw[0].recipient == "oc_chat"
     assert ingress.raw[0].message.content == "hello"
-    rejected = await adapter._ingest_message(
+    async def download(message_id: str, file_key: str, resource_type: str) -> bytes:
+        assert (message_id, file_key, resource_type) == ("msg-2", "img", "image")
+        return b"image-bytes"
+
+    adapter._download_resource_bytes = download
+    image = await adapter._ingest_message(
         _message(message_type="image", content='{"image_key":"img"}'),
         "msg-2",
         "oc_chat",
@@ -556,8 +711,10 @@ async def test_text_inbound_admits_raw_message_and_attachment_is_rejected() -> N
         "",
         "",
     )
-    assert rejected is DeliveryStatus.REJECTED
-    assert len(ingress.raw) == 1
+    assert image is DeliveryStatus.DELIVERED
+    assert len(ingress.raw) == 2
+    assert ingress.raw[1].message.content == "[图片]"
+    assert ingress.raw[1].message.attachments[0].size_bytes == len(b"image-bytes")
 
 
 @pytest.mark.asyncio
