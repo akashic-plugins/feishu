@@ -14,6 +14,7 @@ import mimetypes
 import threading
 import time
 import warnings
+from urllib.parse import urlsplit
 from collections.abc import AsyncIterable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -61,7 +62,8 @@ _CARD_TEXT_LIMIT = 4000
 _WS_RECONNECT_DELAY_S = 5.0
 _WS_STOP_TIMEOUT_S = 2.0
 _REJECTED_HTTP_STATUSES = frozenset({400, 401, 403, 404, 405, 413, 415, 422})
-_RATE_LIMIT_CODES = frozenset({99991400, 99991661, 230020, 230027, 11232})
+_REJECTED_BUSINESS_CODES: frozenset[int] = frozenset()
+_FEISHU_API_HOSTS = frozenset({"open.feishu.cn", "open.larksuite.com"})
 _CREDENTIAL_ALIASES = {
     "app_id": ("appId", "app_id"),
     "app_secret": ("appSecret", "app_secret"),
@@ -211,7 +213,7 @@ class FeishuAdapter:
             self._provider_client = await self._provider_factory.create(self._credentials)
             self._read_credential("app_id")
             self._read_credential("app_secret")
-            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
 
             # 2. Subscribe through the exact Core stream and keep admission closed.
             turn_stream = self._presentation.turn_stream
@@ -381,9 +383,7 @@ class FeishuAdapter:
         try:
             provider_key = await self._upload_attachment(ref, data)
         except asyncio.CancelledError:
-            raise
-        except ValueError as error:
-            return DeliveryStatus.REJECTED, None, str(error)
+            return DeliveryStatus.UNKNOWN, None, "Feishu attachment upload 被取消，效果未知"
         except Exception as error:
             return _feishu_error_status(error), None, str(error) or type(error).__name__
         try:
@@ -398,7 +398,7 @@ class FeishuAdapter:
                 ),
             )
         except asyncio.CancelledError:
-            raise
+            return DeliveryStatus.UNKNOWN, None, "Feishu attachment send 被取消，效果未知"
         except Exception as error:
             # The upload already changed provider state; a send failure is not a
             # deterministic no-effect rejection even when the HTTP status is 4xx.
@@ -802,7 +802,12 @@ class FeishuAdapter:
             return _extract_text(content_raw), []
         if message_type == "image":
             image_key = _extract_key(content_raw, "image_key")
-            data = await self._download_resource_bytes(message_id, image_key, "image")
+            data = await self._download_resource_bytes(
+                message_id,
+                image_key,
+                "image",
+                max_bytes=min(_MAX_ATTACHMENT_BYTES, _MAX_ATTACHMENT_BATCH_BYTES),
+            )
             _check_inbound_batch((data,))
             return "[图片]", [
                 await self._import_inbound_attachment(
@@ -815,7 +820,12 @@ class FeishuAdapter:
         if message_type == "file":
             file_name = _extract_key(content_raw, "file_name") or "file"
             file_key = _extract_key(content_raw, "file_key")
-            data = await self._download_resource_bytes(message_id, file_key, "file")
+            data = await self._download_resource_bytes(
+                message_id,
+                file_key,
+                "file",
+                max_bytes=min(_MAX_ATTACHMENT_BYTES, _MAX_ATTACHMENT_BATCH_BYTES),
+            )
             _check_inbound_batch((data,))
             media_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
             return f"[文件: {file_name}]", [
@@ -832,9 +842,18 @@ class FeishuAdapter:
                 raise ValueError("Feishu 入站附件数量超过上限")
             attachments: list[AttachmentRef] = []
             downloaded: list[bytes] = []
+            remaining = _MAX_ATTACHMENT_BATCH_BYTES
             for index, image_key in enumerate(image_keys, start=1):
-                data = await self._download_resource_bytes(message_id, image_key, "image")
+                if remaining <= 0:
+                    raise ValueError("Feishu 入站附件批次超过总大小上限")
+                data = await self._download_resource_bytes(
+                    message_id,
+                    image_key,
+                    "image",
+                    max_bytes=min(_MAX_ATTACHMENT_BYTES, remaining),
+                )
                 downloaded.append(data)
+                remaining -= len(data)
             _check_inbound_batch(downloaded)
             for index, data in enumerate(downloaded, start=1):
                 attachments.append(
@@ -854,11 +873,15 @@ class FeishuAdapter:
         message_id: str,
         file_key: str,
         resource_type: str,
+        *,
+        max_bytes: int,
     ) -> bytes:
         """Download one provider resource with a fixed memory bound."""
 
         _provider_segment(message_id, "Feishu message_id")
         _provider_segment(file_key, "Feishu file_key")
+        if max_bytes <= 0 or max_bytes > _MAX_ATTACHMENT_BYTES:
+            raise ValueError("Feishu 入站附件读取额度非法")
         if self._client is None:
             raise RuntimeError("Feishu HTTP client 尚未 start")
         token = await self._get_access_token()
@@ -870,7 +893,7 @@ class FeishuAdapter:
             follow_redirects=False,
         ) as response:
             response.raise_for_status()
-            return await _bounded_response_bytes(response)
+            return await _bounded_response_bytes(response, max_bytes=max_bytes)
 
     async def _import_inbound_attachment(
         self,
@@ -1123,20 +1146,22 @@ class FeishuAdapter:
         content: str,
     ) -> tuple[DeliveryStatus, str | None, str | None]:
         try:
-            payload = await self._post_message_once(recipient, message_type, content)
-        except asyncio.CancelledError:
-            raise
+            self._resolve_receive(recipient)
         except ValueError as error:
             return DeliveryStatus.REJECTED, None, str(error)
+        try:
+            payload = await self._post_message_once(recipient, message_type, content)
+        except asyncio.CancelledError:
+            return DeliveryStatus.UNKNOWN, None, "Feishu provider send 被取消，效果未知"
+        except ValueError as error:
+            return DeliveryStatus.UNKNOWN, None, str(error)
         except httpx.HTTPStatusError as error:
             status = error.response.status_code
             if status in _REJECTED_HTTP_STATUSES:
                 return DeliveryStatus.REJECTED, None, f"HTTP {status}"
             return DeliveryStatus.UNKNOWN, None, f"HTTP {status}"
         except FeishuApiError as error:
-            if error.code in _RATE_LIMIT_CODES:
-                return DeliveryStatus.UNKNOWN, None, str(error)
-            return DeliveryStatus.REJECTED, None, str(error)
+            return _feishu_error_status(error), None, str(error)
         except httpx.RequestError as error:
             return _feishu_error_status(error), None, str(error) or type(error).__name__
         except Exception as error:
@@ -1159,16 +1184,14 @@ class FeishuAdapter:
             _provider_segment(message_id, "Feishu message_id")
             await self._patch_message_once(message_id, content)
         except asyncio.CancelledError:
-            raise
+            return DeliveryStatus.UNKNOWN, "Feishu provider patch 被取消，效果未知"
         except httpx.HTTPStatusError as error:
             status = error.response.status_code
             if status in _REJECTED_HTTP_STATUSES:
                 return DeliveryStatus.REJECTED, f"HTTP {status}"
             return DeliveryStatus.UNKNOWN, f"HTTP {status}"
         except FeishuApiError as error:
-            if error.code in _RATE_LIMIT_CODES:
-                return DeliveryStatus.UNKNOWN, str(error)
-            return DeliveryStatus.REJECTED, str(error)
+            return _feishu_error_status(error), str(error)
         except Exception as error:
             return DeliveryStatus.UNKNOWN, str(error) or type(error).__name__
         return DeliveryStatus.DELIVERED, None
@@ -1403,10 +1426,25 @@ class FeishuAdapter:
 
 
 def _domain(config: Mapping[str, object]) -> str:
+    """Validate the sole owner of every credential-bearing Feishu API URL."""
+
     value = config.get("domain", "https://open.feishu.cn")
-    if not isinstance(value, str) or not value.strip():
-        return "https://open.feishu.cn"
-    return value.rstrip("/")
+    if not isinstance(value, str) or value != value.strip() or not value:
+        raise ValueError("Feishu domain 必须是非空 HTTPS URL")
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() != "https" or parsed.hostname not in _FEISHU_API_HOSTS:
+        raise ValueError("Feishu domain 必须是官方 HTTPS API 域名")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Feishu domain 禁止 userinfo")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("Feishu domain 端口非法") from error
+    if port not in (None, 443):
+        raise ValueError("Feishu domain 只允许默认 HTTPS 端口")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError("Feishu domain 禁止 path/query/fragment")
+    return f"https://{parsed.hostname}"
 
 
 def _allow_from(config: Mapping[str, object]) -> frozenset[str]:
@@ -1599,9 +1637,9 @@ def _feishu_error_status(error: BaseException) -> DeliveryStatus:
         )
     if isinstance(error, FeishuApiError):
         return (
-            DeliveryStatus.UNKNOWN
-            if error.code in _RATE_LIMIT_CODES
-            else DeliveryStatus.REJECTED
+            DeliveryStatus.REJECTED
+            if error.code in _REJECTED_BUSINESS_CODES
+            else DeliveryStatus.UNKNOWN
         )
     if isinstance(error, httpx.RequestError) and _is_pre_effect_request_error(error):
         return DeliveryStatus.REJECTED
@@ -1642,9 +1680,21 @@ async def _close_attachment_lease(lease: Any) -> None:
     return result
 
 
-async def _bounded_response_bytes(response: Any) -> bytes:
+async def _bounded_response_bytes(response: Any, *, max_bytes: int) -> bytes:
     """Collect a provider response without exceeding the attachment memory bound."""
 
+    if max_bytes <= 0 or max_bytes > _MAX_ATTACHMENT_BYTES:
+        raise ValueError("Feishu 入站附件读取额度非法")
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        raw_length = headers.get("content-length")
+        if raw_length is not None:
+            try:
+                content_length = int(raw_length)
+            except (TypeError, ValueError) as error:
+                raise ValueError("Feishu provider Content-Length 非法") from error
+            if content_length < 0 or content_length > max_bytes:
+                raise ValueError("Feishu 入站附件超过剩余批次额度")
     chunks: list[bytes] = []
     total = 0
     aiter_bytes = getattr(response, "aiter_bytes", None)
@@ -1655,7 +1705,7 @@ async def _bounded_response_bytes(response: Any) -> bytes:
         if not isinstance(chunk, bytes):
             raise TypeError("Feishu provider response chunk 必须是 bytes")
         total += len(chunk)
-        if total > _MAX_ATTACHMENT_BYTES:
-            raise ValueError("Feishu 入站附件超过大小上限")
+        if total > max_bytes:
+            raise ValueError("Feishu 入站附件超过剩余批次额度")
         chunks.append(chunk)
     return b"".join(chunks)

@@ -227,7 +227,7 @@ def _context(
         config=(
             config
             if config is not None
-            else {"allow_from": ("ou_sender",), "domain": "https://example.test"}
+            else {"allow_from": ("ou_sender",), "domain": "https://open.feishu.cn"}
         ),
         credentials={
             "appId": CredentialRef(("appId",)),
@@ -576,7 +576,7 @@ async def test_attachment_delivery_reads_exact_bytes_and_preserves_text_file_ord
 
 
 @pytest.mark.asyncio
-async def test_attachment_upload_failure_is_rejected_without_attachment_message() -> None:
+async def test_attachment_upload_business_error_is_unknown_without_attachment_message() -> None:
     stream = FakeTurnStream()
     data = b"x"
     attachment = AttachmentRef(
@@ -610,13 +610,13 @@ async def test_attachment_upload_failure_is_rejected_without_attachment_message(
     receipt = await adapter.deliver(
         ProviderDeliveryRequest("binding-1", "delivery-failure", "oc_chat", "", (attachment,))
     )
-    assert receipt.status is DeliveryStatus.REJECTED
+    assert receipt.status is DeliveryStatus.UNKNOWN
     assert calls == []
     await adapter.stop()
 
 
 @pytest.mark.asyncio
-async def test_attachment_delivery_propagates_cancel_and_closes_read_lease() -> None:
+async def test_attachment_delivery_cancel_settles_unknown_and_closes_read_lease() -> None:
     stream = FakeTurnStream()
     data = b"x"
     attachment = AttachmentRef(
@@ -632,15 +632,24 @@ async def test_attachment_delivery_propagates_cancel_and_closes_read_lease() -> 
     adapter._run_ws_client = lambda: adapter._ws_stopped.wait()
     adapter.attach_presentation(ChannelPresentationPorts(FakeControl(), stream))
     await adapter.start()
+    started = asyncio.Event()
 
     async def upload(data: bytes, filename: str):
-        raise asyncio.CancelledError
+        started.set()
+        await asyncio.Event().wait()
 
     adapter._upload_file = upload
-    with pytest.raises(asyncio.CancelledError):
-        await adapter.deliver(
-            ProviderDeliveryRequest("binding-1", "delivery-cancel", "oc_chat", "", (attachment,))
+    task = asyncio.create_task(
+        adapter.deliver(
+            ProviderDeliveryRequest(
+                "binding-1", "delivery-cancel", "oc_chat", "", (attachment,)
+            )
         )
+    )
+    await started.wait()
+    task.cancel()
+    receipt = await task
+    assert receipt.status is DeliveryStatus.UNKNOWN
     assert read.leases[0].closed
     await adapter.stop()
 
@@ -660,7 +669,9 @@ async def test_delivery_fallback_only_runs_after_deterministic_card_rejection() 
     async def rejected_card(recipient: str, message_type: str, content: str):
         calls.append(message_type)
         if message_type == "interactive":
-            raise module.channel.FeishuApiError(123, "card rejected")
+            request = httpx.Request("POST", "https://open.feishu.cn/open-apis/im/v1/messages")
+            response = httpx.Response(400, request=request)
+            raise httpx.HTTPStatusError("card rejected", request=request, response=response)
         return {"message_id": "text-fallback"}
 
     adapter._post_message_once = rejected_card
@@ -669,6 +680,19 @@ async def test_delivery_fallback_only_runs_after_deterministic_card_rejection() 
     )
     assert fallback.status is DeliveryStatus.DELIVERED
     assert calls == ["interactive", "text"]
+
+    calls.clear()
+
+    async def unknown_business_code(recipient: str, message_type: str, content: str):
+        calls.append(message_type)
+        raise module.channel.FeishuApiError(123, "provider effect unspecified")
+
+    adapter._post_message_once = unknown_business_code
+    business_unknown = await adapter.deliver(
+        ProviderDeliveryRequest("binding-1", "delivery-business", "oc_chat", "hello")
+    )
+    assert business_unknown.status is DeliveryStatus.UNKNOWN
+    assert calls == ["interactive"]
 
     calls.clear()
 
@@ -779,14 +803,92 @@ async def test_inbound_download_streams_and_enforces_bound_before_import(
 
     adapter._client = Client()
     adapter._get_access_token = token
-    with pytest.raises(ValueError, match="超过大小上限"):
-        await adapter._download_resource_bytes("message-1", "file-1", "file")
+    with pytest.raises(ValueError, match="超过剩余批次额度"):
+        await adapter._download_resource_bytes(
+            "message-1", "file-1", "file", max_bytes=3
+        )
     assert calls == [
         (
             "GET",
-            "https://example.test/open-apis/im/v1/messages/message-1/resources/file-1",
+            "https://open.feishu.cn/open-apis/im/v1/messages/message-1/resources/file-1",
         )
     ]
+
+
+def test_malicious_domain_is_rejected_before_credentials_or_http() -> None:
+    factory = FakeProviderFactory()
+    context = _context(
+        factory=factory,
+        config={
+            "allow_from": ("ou_sender",),
+            "domain": "https://open.feishu.cn@evil.example/steal",
+        },
+    )
+    with pytest.raises(ValueError, match="官方 HTTPS API 域名"):
+        module.build_feishu_channel(context)
+    assert factory.create_calls == 0
+    assert factory.client.requested == []
+
+
+@pytest.mark.asyncio
+async def test_post_batch_applies_remaining_budget_before_second_stream_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module.channel, "_MAX_ATTACHMENT_BATCH_BYTES", 3)
+    imported = FakeAttachmentImport()
+    adapter = module.build_feishu_channel(_context(attachment_import=imported))
+    streamed: list[tuple[str, bool]] = []
+
+    class Response:
+        def __init__(self, key: str) -> None:
+            self.key = key
+            self.headers = {"content-length": "2"}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_bytes(self):
+            streamed.append((self.key, True))
+            yield b"xx"
+
+    class Stream:
+        def __init__(self, key: str) -> None:
+            self.response = Response(key)
+
+        async def __aenter__(self) -> Response:
+            return self.response
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+    class Client:
+        def stream(self, _method: str, url: str, **_kwargs) -> Stream:
+            key = url.rsplit("/", 1)[-1]
+            streamed.append((key, False))
+            return Stream(key)
+
+    async def token() -> str:
+        return "token"
+
+    adapter._client = Client()
+    adapter._get_access_token = token
+    message = _message(
+        message_type="post",
+        content=json.dumps(
+            {
+                "content": [
+                    [
+                        {"tag": "img", "image_key": "first"},
+                        {"tag": "img", "image_key": "second"},
+                    ]
+                ]
+            }
+        ),
+    )
+    with pytest.raises(ValueError, match="剩余批次额度"):
+        await adapter._extract_inbound_payload(message, "message-1")
+    assert streamed == [("first", False), ("first", True), ("second", False)]
+    assert imported.calls == []
 
 
 @pytest.mark.asyncio
@@ -869,8 +971,18 @@ async def test_text_and_image_inbound_import_core_attachment_before_admission() 
     assert ingress.raw[0].provider_identity == "ou_sender"
     assert ingress.raw[0].recipient == "oc_chat"
     assert ingress.raw[0].message.content == "hello"
-    async def download(message_id: str, file_key: str, resource_type: str) -> bytes:
+    async def download(
+        message_id: str,
+        file_key: str,
+        resource_type: str,
+        *,
+        max_bytes: int,
+    ) -> bytes:
         assert (message_id, file_key, resource_type) == ("msg-2", "img", "image")
+        assert max_bytes == min(
+            module.channel._MAX_ATTACHMENT_BYTES,
+            module.channel._MAX_ATTACHMENT_BATCH_BYTES,
+        )
         return b"image-bytes"
 
     adapter._download_resource_bytes = download
@@ -898,7 +1010,7 @@ async def test_unauthorized_inbound_and_control_are_fail_closed() -> None:
             ingress=ingress,
             control=control,
             stream=stream,
-            config={"allowFrom": (), "domain": "https://example.test"},
+            config={"allowFrom": (), "domain": "https://open.feishu.cn"},
         )
     )
     adapter.attach_presentation(
@@ -924,7 +1036,7 @@ async def test_legacy_allow_from_alias_reaches_inbound_allowlist() -> None:
         _context(
             ingress=ingress,
             stream=stream,
-            config={"allowFrom": ("ou_sender",), "domain": "https://example.test"},
+            config={"allowFrom": ("ou_sender",), "domain": "https://open.feishu.cn"},
         )
     )
     adapter.attach_presentation(
