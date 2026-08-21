@@ -59,7 +59,7 @@ jobs:
       - name: Check v3 source types
         env:
           PYTHONPATH: .akashic-core
-        run: .venv/bin/pyright --level error plugin.py channel.py config.py cards.py tests
+        run: .venv/bin/pyright --pythonpath .venv/bin/python --level error plugin.py channel.py config.py cards.py tests
       - name: Compile Python sources
         run: python -m compileall -q plugin.py channel.py config.py cards.py tests
       - name: Check diff formatting
