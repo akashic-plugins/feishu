@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: kachofugetsu09/akashic-agent
-          ref: b97f919b1fd865d23d11095cbc63d2354803bad9
+          ref: 3005f838bcd96e2cbc58616aede46e4f39df4523
           path: .akashic-core
       - uses: actions/setup-python@v5
         with:
@@ -59,7 +59,7 @@ jobs:
       - name: Check v3 source types
         env:
           PYTHONPATH: .akashic-core
-        run: .venv/bin/basedpyright --level error plugin.py channel.py config.py cards.py tests
+        run: .venv/bin/pyright --level error plugin.py channel.py config.py cards.py tests
       - name: Compile Python sources
         run: python -m compileall -q plugin.py channel.py config.py cards.py tests
       - name: Check diff formatting
