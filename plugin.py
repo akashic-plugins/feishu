@@ -1,31 +1,59 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from agent.plugin_composition import (
+    CHANNELS,
+    ChannelCapability,
+    ChannelDefinition,
+    Context,
+    InboundIdentity,
+    PluginChannels,
+)
 
-from agent.plugins import Plugin
-from .channel import FeishuChannel
-from .config import FeishuConfigModel
-
-if TYPE_CHECKING:
-    from infra.channels.contract import Channel
+from .channel import FeishuAdapter, build_feishu_channel
+from .config import FeishuConfig
 
 
-class FeishuPlugin(Plugin):
-    api_version = 2
-    name = "feishu"
-    version = "1.0.0"
-    desc = "飞书私聊渠道"
-    ConfigModel = FeishuConfigModel
+api_version = 3
+name = "feishu"
+version = "3.0.0"
+desc = "飞书私聊 v3 channel adapter"
+author = "Akashic"
+inject = (CHANNELS,)
+Config = FeishuConfig
 
-    def channels(self) -> list["Channel"]:
-        config = cast(FeishuConfigModel | None, self.context.config)
-        if config is None or not config.app_id or not config.app_secret:
-            return []
-        return [
-            FeishuChannel(
-                app_id=config.app_id,
-                app_secret=config.app_secret,
-                allow_from=config.allow_from,
-                domain=config.domain,
-            )
-        ]
+
+async def apply(ctx: Context, config: FeishuConfig) -> None:
+    """Register the immutable Feishu channel definition in the exact Root."""
+
+    channels: PluginChannels = ctx.require(CHANNELS)
+    await channels.register(
+        ctx,
+        ChannelDefinition(
+            name="feishu",
+            capabilities=frozenset(
+                {
+                    ChannelCapability.INBOUND,
+                    ChannelCapability.OUTBOUND,
+                    ChannelCapability.CONTROL,
+                    ChannelCapability.TURN_STREAM,
+                }
+            ),
+            factory_export="build_feishu_channel",
+            inbound_identity=InboundIdentity.PROVIDER_MESSAGE_ID,
+            credential_paths=("appId", "appSecret", "app_id", "app_secret"),
+        ),
+    )
+
+
+__all__ = [
+    "Config",
+    "FeishuAdapter",
+    "api_version",
+    "apply",
+    "author",
+    "build_feishu_channel",
+    "desc",
+    "inject",
+    "name",
+    "version",
+]

@@ -1,0 +1,11 @@
+schema_version = 1
+name = "feishu"
+version = "3.0.0"
+api_version = 3
+entrypoint = "plugin.py"
+
+[[python]]
+requirements = "requirements.txt"
+
+[channel_credentials]
+feishu = ["appId", "appSecret", "app_id", "app_secret"]
